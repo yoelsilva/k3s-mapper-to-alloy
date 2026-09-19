@@ -42,7 +42,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def log(*a):
@@ -268,6 +268,16 @@ def alias(a):
     return a.get("dueno") or a["host"]
 
 
+def nodo_id(nombre):
+    """Id seguro y estable del nodo: "n_" + todo lo que no sea [A-Za-z0-9_] a "_".
+
+    Se deriva del nombre, así que es estable entre ciclos sin guardar estado.
+    Dos nombres que solo difieran en signos de puntuación colisionan en un único
+    nodo del grafo; es aceptable porque el nombre ya viene deduplicado por alias.
+    """
+    return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", str(nombre))
+
+
 def sondear(addr, puerto):
     t0 = time.monotonic()
     try:
@@ -338,9 +348,12 @@ def metricas():
     for a in sorted(aristas, key=lambda a: (a["src"], a["host"], a["puerto"])):
         k = (direccion(a), a["puerto"])
         valor = sondas[k][0] if k in sondas else 2
-        out.append('dependencia{namespace="%s",src="%s",src_tipo="%s",dst="%s",dst_svc="%s",'
-                   'dst_addr="%s",dst_port="%s",clave="%s",externo="%s"} %d' % (
-                       esc(a["ns"]), esc(a["src"]), esc(a["tipo"]), esc(alias(a)),
+        dst = alias(a)
+        out.append('dependencia{namespace="%s",src="%s",src_id="%s",src_tipo="%s",'
+                   'dst="%s",dst_id="%s",dst_svc="%s",dst_addr="%s",dst_port="%s",'
+                   'clave="%s",externo="%s"} %d' % (
+                       esc(a["ns"]), esc(a["src"]), nodo_id(a["src"]), esc(a["tipo"]),
+                       esc(dst), nodo_id(dst),
                        esc(a["host"] if a["interno"] else ""), esc(a["host"]), esc(a["puerto"]),
                        esc(a["clave"]), "false" if a["interno"] else "true", valor))
     out.append("# HELP dependencia_duracion_segundos Tiempo de la sonda TCP al destino.")

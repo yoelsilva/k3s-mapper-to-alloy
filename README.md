@@ -57,7 +57,7 @@ se deduce del esquema (`https` → 443) o de la clave (`REDIS_*` → 6379, `KAFK
 ### Métricas
 
 ```
-dependencia{namespace,src,src_tipo,dst,dst_svc,dst_addr,dst_port,clave,externo}
+dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_addr,dst_port,clave,externo}
     1 = destino alcanzable · 0 = no alcanzable · 2 = en no_sondear
 dependencia_duracion_segundos{dst,dst_port}
 dependencia_fallo_motivo{dst,dst_port,motivo}      motivo: timeout | refused | dns | error
@@ -71,6 +71,11 @@ dependencia_mapper_errores_total
 `dst` es el nombre del nodo destino: alias explícito > workload dueño > host.
 `dst_svc` conserva el nombre del Service; `dst_addr` el host tal cual estaba
 escrito.
+
+`src_id` y `dst_id` son el mismo nombre pasado por `[^A-Za-z0-9_] -> _` con prefijo
+`n_`: identificadores seguros para usar como id de nodo en un grafo, estables entre
+ciclos porque se derivan del nombre y no de ningún estado guardado. Existen desde
+0.2.0; el panel `tecopos-mapa-panel` los exige.
 
 ## Desplegar en un clúster
 
@@ -173,8 +178,8 @@ no la contraseña).
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.1.0 && git push --tags
-#  → threeface/dependencias-mapper:0.1.0, :0.1 y :latest
+git tag v0.2.0 && git push --tags
+#  → threeface/dependencias-mapper:0.2.0, :0.2 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
