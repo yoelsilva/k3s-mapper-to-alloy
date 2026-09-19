@@ -1,0 +1,63 @@
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# El namespace de la imagen es fijo: DOCKERHUB_USERNAME sirve solo para el
+# login, y puede ser una cuenta personal con permiso de push sobre la org.
+env:
+  IMAGE: threeface/dependencias-mapper
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar sintaxis
+        run: python3 -m py_compile mapper.py
+
+      - name: Validar manifiestos
+        run: |
+          python3 -m pip install --quiet pyyaml
+          for f in deploy/*.yaml; do python3 -c "import sys,yaml; list(yaml.safe_load_all(open('$f')))" || exit 1; done
+          python3 -m json.tool config.example.json > /dev/null
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Etiquetas:
+      #   push a main  -> :main y :sha-xxxxxxx
+      #   tag v1.2.3   -> :1.2.3, :1.2 y :latest
+      - name: Etiquetas de imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build y push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

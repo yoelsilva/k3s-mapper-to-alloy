@@ -1,0 +1,40 @@
+# Identidad del pod y permiso de SOLO LECTURA.
+#
+# El ClusterRole define QUÉ se puede leer (sin Secrets). No concede nada por sí
+# mismo: hay que enlazarlo con un RoleBinding en CADA namespace que se quiera
+# mapear. Así el mapper solo ve los namespaces que le des explícitamente.
+#
+# Para añadir un namespace: copia el RoleBinding cambiando `namespace`, y añade
+# el nombre a "namespaces" en la configuración.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dependencias-mapper
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dependencias-mapper-lectura
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dependencias-mapper-lectura
+  namespace: tecopos              # <- un RoleBinding por namespace mapeado
+subjects:
+  - kind: ServiceAccount
+    name: dependencias-mapper
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: dependencias-mapper-lectura
+  apiGroup: rbac.authorization.k8s.io

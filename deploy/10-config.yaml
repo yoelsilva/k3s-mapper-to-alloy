@@ -1,0 +1,47 @@
+# Configuración del mapper. Es lo ÚNICO que cambia entre clústeres:
+#   - namespaces: qué namespaces leer (cada uno necesita su RoleBinding)
+#   - alias: nombre legible para IPs y hosts externos
+#   - no_sondear: destinos que se dibujan pero no se tocan
+#
+# Tras editarlo: kubectl apply -f 10-config.yaml && kubectl -n monitoring rollout restart deploy/dependencias-mapper
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dependencias-mapper-config
+  namespace: monitoring
+data:
+  config.json: |
+    {
+      "namespaces": ["tecopos"],
+      "intervalo_segundos": 60,
+      "timeout_sonda_segundos": 3,
+
+      "alias": {
+        "172.16.0.9:5432":   "postgres-principal",
+        "172.16.0.9:31878":  "controlserver (NodePort)",
+        "172.16.0.9:31821":  "hermes-server (NodePort)",
+        "172.16.0.9:32272":  "midas-server (NodePort)",
+        "172.16.0.9:31072":  "media-service (NodePort)",
+        "172.16.0.9":        "nodo-172.16.0.9",
+        "172.16.0.13":       "apiv1-instancia-0",
+        "172.16.0.14":       "kafka-minio",
+        "172.16.0.17":       "hermes-externo",
+        "172.16.0.22":       "apiv1-instancia-1",
+        "172.16.0.24":       "agentes-host",
+        "10.0.0.14":         "apiv1-instancia-2",
+        "10.0.0.15":         "apiv1-instancia-3",
+        "10.128.56.1":       "router-lte",
+        "152.206.64.213":    "transfermovil",
+        "emqx-svc.brokers":  "emqx (brokers)",
+        "mqtt.tecopos.com":  "broker-mqtt",
+        "o4509674404315136.ingest.us.sentry.io": "sentry"
+      },
+
+      "no_sondear": [],
+
+      "hosts_ignorar": ["0.0.0.0", "127.0.0.1", "localhost", "::", "::1"],
+      "claves_regex": "(HOST|HOSTS|URL|URLS|URI|ADDR|ADDRESS|ENDPOINT|BROKER|BROKERS|SERVER)$",
+      "claves_excluir_regex": "(CORS|ORIGIN|ALLOWLIST|WHITELIST|PUBLIC|DOMAIN|THIS_URL|REDIRECT|_WEB_URL$|PORTAL_BASE_URL)",
+      "prefijos_navegador": ["VITE_", "REACT_APP_", "NEXT_PUBLIC_", "VUE_APP_"],
+      "incluir_navegador": false
+    }

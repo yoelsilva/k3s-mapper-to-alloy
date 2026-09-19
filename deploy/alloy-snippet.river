@@ -1,0 +1,39 @@
+// ═══════════════════════════════════════════════════════
+// MAPA DE DEPENDENCIAS — dependencias-mapper
+// Pegar dentro de `alloy.configMap.content` (6 espacios de sangría
+// si el values sigue el formato del chart grafana/alloy).
+//
+// Flechas declaradas en las env de cada servicio y su estado según
+// sonda TCP. Fuente del Node Graph en Grafana.
+//
+//   Flechas en rojo:   dependencia == 0
+//   Flecha sin sonda:  dependencia == 2
+//   Mapper parado:     time() - dependencia_mapper_ultima_lectura_timestamp_seconds > 300
+// ═══════════════════════════════════════════════════════
+
+discovery.kubernetes "dependencias" {
+  role = "pod"
+  namespaces {
+    names = ["monitoring"]
+  }
+  selectors {
+    role  = "pod"
+    label = "app.kubernetes.io/name=dependencias-mapper"
+  }
+}
+
+prometheus.scrape "dependencias" {
+  targets         = discovery.kubernetes.dependencias.targets
+  forward_to      = [prometheus.relabel.dependencias_filter.receiver]
+  job_name        = "dependencias"
+  scrape_interval = "30s"
+}
+
+prometheus.relabel "dependencias_filter" {
+  forward_to = [prometheus.remote_write.default.receiver]
+  rule {
+    source_labels = ["__name__"]
+    regex  = "up|dependencia|dependencia_duracion_segundos|dependencia_fallo_motivo|dependencia_mapper_.*"
+    action = "keep"
+  }
+}

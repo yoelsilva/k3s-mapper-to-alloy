@@ -1,0 +1,85 @@
+# El mapper como imagen. La publica el workflow en Docker Hub; aquí se fija
+# siempre una versión concreta (nunca :latest en producción).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dependencias-mapper
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: dependencias-mapper
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dependencias-mapper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dependencias-mapper
+    spec:
+      serviceAccountName: dependencias-mapper
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mapper
+          image: threeface/dependencias-mapper:0.1.0   # <- fija siempre una versión concreta
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CONFIG
+              value: /config/config.json
+          ports:
+            - name: metrics
+              containerPort: 9400
+          resources:
+            requests:
+              cpu: 20m
+              memory: 48Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 90
+            periodSeconds: 60
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: dependencias-mapper-config
+---
+# Service opcional: permite scrapear por nombre estable y hacer port-forward
+# sin buscar el pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dependencias-mapper
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: dependencias-mapper
+spec:
+  selector:
+    app.kubernetes.io/name: dependencias-mapper
+  ports:
+    - name: metrics
+      port: 9400
+      targetPort: metrics
