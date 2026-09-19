@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="dependencias-mapper" \
       org.opencontainers.image.description="Mapa de dependencias declaradas de un clúster Kubernetes, expuesto como métricas Prometheus" \
-      org.opencontainers.image.source="https://github.com/threeface/dependencias-mapper"
+      org.opencontainers.image.source="https://github.com/yoelsilva/k3s-mapper-to-alloy"
 
 # Sin dependencias externas: solo librería estándar.
 ENV PYTHONDONTWRITEBYTECODE=1 \

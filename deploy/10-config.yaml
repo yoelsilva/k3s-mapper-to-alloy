@@ -3,6 +3,9 @@
 #   - alias: nombre legible para IPs y hosts externos
 #   - no_sondear: destinos que se dibujan pero no se tocan
 #
+# Los alias de abajo son EJEMPLOS. El mapa real de direcciones de un clúster es
+# información de red interna: va en el ConfigMap de ese clúster, no en el repo.
+#
 # Tras editarlo: kubectl apply -f 10-config.yaml && kubectl -n monitoring rollout restart deploy/dependencias-mapper
 apiVersion: v1
 kind: ConfigMap
@@ -17,24 +20,17 @@ data:
       "timeout_sonda_segundos": 3,
 
       "alias": {
-        "172.16.0.9:5432":   "postgres-principal",
-        "172.16.0.9:31878":  "controlserver (NodePort)",
-        "172.16.0.9:31821":  "hermes-server (NodePort)",
-        "172.16.0.9:32272":  "midas-server (NodePort)",
-        "172.16.0.9:31072":  "media-service (NodePort)",
-        "172.16.0.9":        "nodo-172.16.0.9",
-        "172.16.0.13":       "apiv1-instancia-0",
-        "172.16.0.14":       "kafka-minio",
-        "172.16.0.17":       "hermes-externo",
-        "172.16.0.22":       "apiv1-instancia-1",
-        "172.16.0.24":       "agentes-host",
-        "10.0.0.14":         "apiv1-instancia-2",
-        "10.0.0.15":         "apiv1-instancia-3",
-        "10.128.56.1":       "router-lte",
-        "152.206.64.213":    "transfermovil",
-        "emqx-svc.brokers":  "emqx (brokers)",
-        "mqtt.tecopos.com":  "broker-mqtt",
-        "o4509674404315136.ingest.us.sentry.io": "sentry"
+        "10.0.0.10:5432":   "postgres-principal",
+        "10.0.0.10:31878":  "controlserver (NodePort)",
+        "10.0.0.10:31821":  "hermes-server (NodePort)",
+        "10.0.0.10":        "nodo-10.0.0.10",
+        "10.0.0.11":        "kafka-minio",
+        "10.0.0.12":        "apiv1-instancia-0",
+        "10.0.0.13":        "apiv1-instancia-1",
+        "203.0.113.20":     "pasarela-pagos",
+        "emqx-svc.brokers": "emqx (brokers)",
+        "mqtt.example.com": "broker-mqtt",
+        "o0000000000000000.ingest.us.sentry.io": "sentry"
       },
 
       "no_sondear": [],

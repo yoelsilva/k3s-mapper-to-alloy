@@ -6,10 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
 
-# El namespace de la imagen es fijo: DOCKERHUB_USERNAME sirve solo para el
-# login, y puede ser una cuenta personal con permiso de push sobre la org.
+# El namespace de la imagen es fijo; DOCKERHUB_USERNAME sirve solo para el login.
 env:
-  IMAGE: threeface/dependencias-mapper
+  IMAGE: yoelsilva/k3s-mapper-to-alloy
 
 jobs:
   build:

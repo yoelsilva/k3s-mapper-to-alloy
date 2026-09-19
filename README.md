@@ -35,10 +35,10 @@ Un valor cuenta como dependencia si, tras trocearlo por comas/espacios:
 
 | Forma del valor | Ejemplo | Aceptado |
 |---|---|---|
-| URL con esquema | `postgresql://u:p@172.16.0.9:5432/db` | siempre |
+| URL con esquema | `postgresql://u:p@10.0.0.10:5432/db` | siempre |
 | `host:puerto` | `controlserver-svc-grpc:50053` | siempre |
 | host suelto | `redis-hermes-server-svc` | solo si la clave casa con `claves_regex` (`*_HOST`, `*_URL`, …) |
-| JSON | `[{"grpcUrl":"172.16.0.13:50056"}]` | solo los `host:puerto` o URLs explícitos que contenga |
+| JSON | `[{"grpcUrl":"10.0.0.12:50056"}]` | solo los `host:puerto` o URLs explícitos que contenga |
 
 Y el host tiene que ser un Service del namespace, una IP, o un nombre con punto.
 `DB_DIALECT=postgres` no es una dependencia porque `postgres` no es nada de eso.
@@ -179,7 +179,7 @@ no la contraseña).
 ```bash
 # actualizar VERSION en mapper.py, y luego:
 git tag v0.2.0 && git push --tags
-#  → threeface/dependencias-mapper:0.2.0, :0.2 y :latest
+#  → yoelsilva/k3s-mapper-to-alloy:0.2.0, :0.2 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
