@@ -172,17 +172,22 @@ print(m.extraer({'REDIS_HOST':'redis-x-svc','KAFKA_BROKERS':'10.0.0.1:9092','COR
 
 ## Publicar una versión
 
-El workflow construye para `amd64` y `arm64` y publica en Docker Hub. Requiere
-dos secrets en el repo: `DOCKERHUB_USERNAME` y `DOCKERHUB_TOKEN` (token de acceso,
-no la contraseña).
+El workflow construye para `amd64` y `arm64` y publica en el registro del propio
+repo, `ghcr.io`. No hace falta ningún secret: Actions inyecta `GITHUB_TOKEN` y el
+workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
 git tag v0.2.0 && git push --tags
-#  → yoelsilva/k3s-mapper-to-alloy:0.2.0, :0.2 y :latest
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.2.0, :0.2 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
+
+La primera publicación crea el paquete en GitHub. Comprueba su visibilidad en
+`https://github.com/users/yoelsilva/packages` → el paquete → *Package settings*:
+si queda **privado**, el clúster necesita un `imagePullSecret` para bajarlo; si lo
+pones **público**, k3s lo descarga sin credenciales.
 
 ## Limitaciones conocidas
 

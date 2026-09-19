@@ -6,9 +6,14 @@ on:
     tags: ["v*"]
   pull_request:
 
-# El namespace de la imagen es fijo; DOCKERHUB_USERNAME sirve solo para el login.
+# La imagen vive en el registro del propio repo (ghcr.io), así que no hacen
+# falta secrets: Actions inyecta GITHUB_TOKEN y basta con pedirle packages:write.
+permissions:
+  contents: read
+  packages: write
+
 env:
-  IMAGE: yoelsilva/k3s-mapper-to-alloy
+  IMAGE: ghcr.io/yoelsilva/k3s-mapper-to-alloy
 
 jobs:
   build:
@@ -28,12 +33,13 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
-      - name: Login Docker Hub
+      - name: Login en ghcr.io
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Etiquetas:
       #   push a main  -> :main y :sha-xxxxxxx
