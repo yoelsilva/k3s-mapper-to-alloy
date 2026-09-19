@@ -79,6 +79,9 @@ ciclos porque se derivan del nombre y no de ningún estado guardado. Existen des
 
 ## Desplegar en un clúster
 
+Inventario detallado de cada objeto, qué hace y qué hay que adaptar:
+[`deploy/README.md`](deploy/README.md).
+
 ```bash
 # 1. permisos (edita el namespace del RoleBinding; uno por namespace a mapear)
 kubectl apply -f deploy/00-rbac.yaml
