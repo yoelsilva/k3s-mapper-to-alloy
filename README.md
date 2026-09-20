@@ -57,7 +57,7 @@ se deduce del esquema (`https` → 443) o de la clave (`REDIS_*` → 6379, `KAFK
 ### Métricas
 
 ```
-dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_addr,dst_port,clave,externo}
+dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_addr,dst_port,dst_kind,clave,externo}
     1 = destino alcanzable · 0 = no alcanzable · 2 = en no_sondear
 dependencia_duracion_segundos{dst,dst_port}
 dependencia_fallo_motivo{dst,dst_port,motivo}      motivo: timeout | refused | dns | error
@@ -76,6 +76,18 @@ escrito.
 `n_`: identificadores seguros para usar como id de nodo en un grafo, estables entre
 ciclos porque se derivan del nombre y no de ningún estado guardado. Existen desde
 0.2.0; el panel `tecopos-mapa-panel` los exige.
+
+`dst_kind` (desde 0.3.0) dice qué clase de cosa es el destino, para que el panel
+elija icono: `postgres`, `mysql`, `mongo`, `redis`, `kafka`, `amqp`, `mqtt`,
+`storage`, `smtp`, `search`, `grpc`, `http`.
+
+Se deduce del esquema de la URL (`postgresql://` → `postgres`) y, si no hay
+esquema, de unos pocos prefijos de clave que no dejan lugar a duda (`REDIS_*`,
+`KAFKA_*`, `MQTT_*`…). **Si no se sabe, la etiqueta va vacía** y Prometheus la
+descarta. Nunca se emite `other`: el panel da prioridad a lo que diga el mapper,
+así que un `other` nuestro apagaría su deducción por puerto, que acierta más que
+una suposición. Por eso `DATABASE_URL`, `DB_*` y `BROKER_*` no cuentan como
+pistas: no dicen de qué motor hablan.
 
 ## Desplegar en un clúster
 
@@ -181,8 +193,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.2.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.2.0, :0.2 y :latest
+git tag v0.3.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.3.0, :0.3 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.

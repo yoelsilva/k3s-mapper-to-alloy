@@ -42,7 +42,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def log(*a):
@@ -121,6 +121,25 @@ PUERTO_CLAVE = [("REDIS", "6379"), ("KAFKA", "9092"), ("BROKER", "9092"), ("MINI
                 ("MAIL", "587"), ("DATABASE", "5432"), ("POSTGRES", "5432"), ("PG", "5432"),
                 ("DB", "5432")]
 
+# Clase del destino para el icono del panel (etiqueta dst_kind). El esquema de
+# la URL es la fuente fiable: quien escribió postgresql:// lo sabia.
+ESQUEMA_CLASE = {"http": "http", "https": "http", "grpc": "grpc",
+                 "postgresql": "postgres", "postgres": "postgres",
+                 "redis": "redis", "rediss": "redis",
+                 "mqtt": "mqtt", "mqtts": "mqtt",
+                 "amqp": "amqp", "amqps": "amqp",
+                 "mongodb": "mongo", "mysql": "mysql",
+                 "smtp": "smtp", "smtps": "smtp",
+                 "kafka": "kafka", "s3": "storage", "minio": "storage"}
+
+# Prefijos de clave que no dejan lugar a duda. Deliberadamente corta: DATABASE,
+# DB, PG y BROKER se quedan fuera porque no dicen de qué motor hablan, y una
+# clase equivocada es peor que ninguna (ver clase()).
+CLASE_CLAVE = [("POSTGRES", "postgres"), ("MYSQL", "mysql"), ("MONGO", "mongo"),
+               ("REDIS", "redis"), ("KAFKA", "kafka"), ("MQTT", "mqtt"),
+               ("MINIO", "storage"), ("ELASTIC", "search"), ("OPENSEARCH", "search"),
+               ("SMTP", "smtp"), ("MAIL", "smtp")]
+
 
 # ── extracción de dependencias ───────────────────────────────────────────
 def normalizar(host, ns):
@@ -185,25 +204,25 @@ def candidatos(clave, valor, servicios, ns, solo_explicitos=False):
         # host suelto sin puerto ni esquema: solo si la clave lo justifica
         if not explicito and not RE_CLAVE.search(clave):
             continue
-        yield host, puerto or puerto_defecto(clave, esquema)
+        yield host, puerto or puerto_defecto(clave, esquema), esquema
 
 
 def extraer(data, servicios, ns):
-    """{(host, puerto): clave} a partir de un dict de variables."""
+    """{(host, puerto): (clave, esquema)} a partir de un dict de variables."""
     deps = {}
     for clave, valor in data.items():
         if RE_EXCLUIR.search(clave):
             continue
         if clave.upper().startswith(PREF_NAVEGADOR) and not INCLUIR_NAVEGADOR:
             continue
-        for host, puerto in candidatos(clave, valor, servicios, ns):
+        for host, puerto, esquema in candidatos(clave, valor, servicios, ns):
             if not puerto:                 # ¿existe <PREFIJO>_PORT?
                 pref = re.sub(r"_(HOST|HOSTS|ADDR|ADDRESS|URL|URI|ENDPOINT|SERVER)$", "", clave.upper())
                 for k2, v2 in data.items():
                     if k2.upper() in (pref + "_PORT", "PORT") and str(v2).isdigit():
                         puerto = str(v2)
             if puerto:
-                deps.setdefault((host, puerto), clave)
+                deps.setdefault((host, puerto), (clave, esquema))
     return deps
 
 
@@ -245,11 +264,11 @@ def leer_topologia():
                     ref = e.get("valueFrom", {}).get("configMapKeyRef")
                     if ref:
                         datos[e["name"]] = cms.get(ref["name"], {}).get(ref["key"], "")
-            for (host, puerto), clave in extraer(datos, servicios, ns).items():
+            for (host, puerto), (clave, esquema) in extraer(datos, servicios, ns).items():
                 if host.startswith(nombre) or dueno.get(host) == nombre:
                     continue                # no me apunto a mí mismo
                 aristas.append({"ns": ns, "src": nombre, "tipo": tipo,
-                                "host": host, "puerto": puerto, "clave": clave,
+                                "host": host, "puerto": puerto, "clave": clave, "esquema": esquema,
                                 "interno": host in servicios, "dueno": dueno.get(host)})
     return aristas, fuentes
 
@@ -266,6 +285,24 @@ def alias(a):
     if expl:
         return expl
     return a.get("dueno") or a["host"]
+
+
+def clase(a):
+    """Clase del destino, para el icono del panel: etiqueta `dst_kind`.
+
+    Solo se emite cuando se sabe de verdad. Si no, cadena vacía, NUNCA "other":
+    el panel da prioridad a lo que diga el mapper, así que un "other" nuestro
+    apagaría su deducción por puerto, que acierta más que una suposición.
+    Prometheus además descarta las etiquetas vacías, asi que no ensucia nada.
+    """
+    esq = (a.get("esquema") or "").lower()
+    if esq in ESQUEMA_CLASE:
+        return ESQUEMA_CLASE[esq]
+    cu = a["clave"].upper()
+    for pref, c in CLASE_CLAVE:
+        if pref in cu:
+            return c
+    return ""
 
 
 def nodo_id(nombre):
@@ -351,11 +388,11 @@ def metricas():
         dst = alias(a)
         out.append('dependencia{namespace="%s",src="%s",src_id="%s",src_tipo="%s",'
                    'dst="%s",dst_id="%s",dst_svc="%s",dst_addr="%s",dst_port="%s",'
-                   'clave="%s",externo="%s"} %d' % (
+                   'dst_kind="%s",clave="%s",externo="%s"} %d' % (
                        esc(a["ns"]), esc(a["src"]), nodo_id(a["src"]), esc(a["tipo"]),
                        esc(dst), nodo_id(dst),
                        esc(a["host"] if a["interno"] else ""), esc(a["host"]), esc(a["puerto"]),
-                       esc(a["clave"]), "false" if a["interno"] else "true", valor))
+                       esc(clase(a)), esc(a["clave"]), "false" if a["interno"] else "true", valor))
     out.append("# HELP dependencia_duracion_segundos Tiempo de la sonda TCP al destino.")
     out.append("# TYPE dependencia_duracion_segundos gauge")
     out.append("# HELP dependencia_fallo_motivo Motivo del fallo de sonda: timeout, refused, dns, error.")
