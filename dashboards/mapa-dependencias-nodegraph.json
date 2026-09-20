@@ -1,0 +1,120 @@
+{
+  "uid": "mapa-dependencias",
+  "title": "Mapa de dependencias",
+  "description": "Flechas declaradas entre servicios y estado de la sonda TCP. Datos del dependencias-mapper. Provisional con Node Graph nativo hasta que exista tecopos-mapa-panel.",
+  "tags": [
+    "dependencias",
+    "mapa"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 5,
+  "refresh": "1m",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "cluster",
+        "label": "Clúster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(dependencia, cluster)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "servicio",
+        "label": "Servicio origen",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(dependencia{cluster=~\"$cluster\"}, src)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "nodeGraph",
+      "title": "Mapa declarado",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 20,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "nodes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "legendFormat": "__auto",
+          "expr": "count by (id, title) (\n    label_replace(label_replace(dependencia{cluster=~\"$cluster\", src=~\"$servicio\"}, \"id\", \"$1\", \"src_id\", \"(.*)\"), \"title\", \"$1\", \"src\", \"(.*)\")\n  or\n    label_replace(label_replace(dependencia{cluster=~\"$cluster\", src=~\"$servicio\"}, \"id\", \"$1\", \"dst_id\", \"(.*)\"), \"title\", \"$1\", \"dst\", \"(.*)\")\n)"
+        },
+        {
+          "refId": "edges",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "legendFormat": "__auto",
+          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace((\n      label_replace(dependencia{cluster=~\"$cluster\", src=~\"$servicio\"} == 0, \"color\", \"#F2495C\", \"src_id\", \".*\")\n    or\n      label_replace(dependencia{cluster=~\"$cluster\", src=~\"$servicio\"} == 1, \"color\", \"#8E8E9E\", \"src_id\", \".*\")\n    or\n      label_replace(dependencia{cluster=~\"$cluster\", src=~\"$servicio\"} == 2, \"color\", \"#5794F2\", \"src_id\", \".*\")\n  ), \"source\", \"$1\", \"src_id\", \"(.*)\"), \"target\", \"$1\", \"dst_id\", \"(.*)\"), \"mainstat\", \"$1\", \"dst_port\", \"(.*)\"), \"detail__clave\", \"$1\", \"clave\", \"(.*)\"), \"detail__servicio\", \"$1\", \"dst_svc\", \"(.*)\"), \"detail__direccion\", \"$1\", \"dst_addr\", \"(.*)\"), \"detail__origen\", \"$1\", \"src\", \"(.*)\"), \"detail__destino\", \"$1\", \"dst\", \"(.*)\"), \"id\", \"-\", \"src_id\", \"dst_id\", \"dst_port\")"
+        }
+      ],
+      "transformations": [],
+      "options": {
+        "nodes": {
+          "mainStatUnit": "flechas"
+        },
+        "edges": {
+          "mainStatUnit": "puerto"
+        },
+        "zoomMode": "cooperative"
+      }
+    }
+  ]
+}

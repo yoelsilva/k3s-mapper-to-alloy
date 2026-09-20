@@ -118,35 +118,35 @@ En Grafana, el selector `$cluster` lo recoge solo.
 
 ## Grafana
 
-Panel **Node graph**, datasource Prometheus, dos consultas con *Format = Table*
-y *Type = Instant*.
+Dashboard listo para importar: [`dashboards/mapa-dependencias-nodegraph.json`](dashboards/mapa-dependencias-nodegraph.json).
+*Dashboards → New → Import → Upload JSON file*, y elige tu datasource de Prometheus.
 
-**A · nodos**
+Usa el **Node graph** nativo. Es provisional: el panel propio
+(`tecopos-mapa-panel`) lo sustituirá con layout por capas, que es su razón de ser.
+
+Trae variables de `cluster` y de servicio origen, ambas con *All*, y colorea las
+flechas por estado: rojo `#F2495C` si la sonda falla, gris `#8E8E9E` si responde,
+azul `#5794F2` si está en `no_sondear`.
+
+### Por qué las etiquetas se construyen en PromQL
+
+El Node graph identifica el frame de aristas por tener un campo llamado
+`source`. La forma "natural" —sacar los campos tal cual y renombrarlos con la
+transformación *Organize fields*— **no funciona**: probado contra Grafana 13.1.1,
+el panel ignora el frame y dibuja los nodos sueltos en rejilla, sin una sola flecha.
+
+Por eso las consultas crean los nombres que el panel espera como etiquetas, con
+`label_replace`, y el panel no lleva ninguna transformación:
 
 ```promql
-count by (id) (
-    label_replace(dependencia{cluster="$cluster"}, "id", "$1", "src", "(.*)")
-  or
-    label_replace(dependencia{cluster="$cluster"}, "id", "$1", "dst", "(.*)")
-)
+label_replace(<expr>, "source", "$1", "src_id", "(.*)")
+label_replace(<expr>, "target", "$1", "dst_id", "(.*)")
+label_replace(<expr>, "mainstat", "$1", "dst_port", "(.*)")
 ```
 
-**B · flechas**
-
-```promql
-label_join(
-    label_replace(dependencia{cluster="$cluster"} == 0, "color", "#F2495C", "src", ".*")
-  or
-    label_replace(dependencia{cluster="$cluster"} == 1, "color", "#8E8E9E", "src", ".*")
-  or
-    label_replace(dependencia{cluster="$cluster"} == 2, "color", "#5794F2", "src", ".*"),
-  "id", "→", "src", "dst", "dst_port"
-)
-```
-
-Transformación *Organize fields* sobre el frame B: `src → source`, `dst → target`,
-`dst_port → mainstat`, `clave → detail__clave`, `dst_svc → detail__service`;
-ocultar el resto. Sobre el frame A: `Value → mainstat`, ocultar `Time`.
+Y aquí es donde se paga lo de `src_id`/`dst_id`: como id de nodo hace falta algo
+seguro, y los nombres legibles llevan espacios y paréntesis
+(`controlserver (NodePort)`).
 
 Alerta básica:
 
