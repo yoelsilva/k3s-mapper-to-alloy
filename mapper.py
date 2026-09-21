@@ -35,6 +35,7 @@ import os
 import re
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -42,7 +43,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def log(*a):
@@ -99,6 +100,8 @@ TIMEOUT = float(CFG.get("timeout_sonda_segundos", 3))
 PUERTO_HTTP = int(os.environ.get("PORT", CFG.get("puerto_http", 9400)))
 ALIAS = CFG.get("alias", {})
 NO_SONDEAR = set(CFG.get("no_sondear", []))
+PROTOCOLOS = CFG.get("protocolos", {})
+PROTOCOLO_PUERTO = CFG.get("protocolo_por_puerto", {})
 HOSTS_IGNORAR = set(CFG.get("hosts_ignorar", ["0.0.0.0", "127.0.0.1", "localhost", "::", "::1"]))
 RE_CLAVE = re.compile(CFG.get("claves_regex",
                               "(HOST|HOSTS|URL|URLS|URI|ADDR|ADDRESS|ENDPOINT|BROKER|BROKERS|SERVER)$"), re.I)
@@ -315,20 +318,137 @@ def nodo_id(nombre):
     return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", str(nombre))
 
 
-def sondear(addr, puerto):
+# ── sondas de protocolo ──────────────────────────────────
+# Hay tres niveles, y solo los dos primeros le tocan al mapper:
+#
+#   1 · red        ¿el puerto acepta conexiones?     responde el kernel
+#   2 · protocolo  ¿hay un programa que hable?       responde el programa
+#   3 · aplicación ¿ese programa está sano?          readinessProbe del servicio
+#
+# El nivel 1 miente. Cuando un programa abre un puerto, es el kernel quien
+# completa el saludo TCP y encola la conexión; si el programa está colgado, el
+# kernel sigue aceptando y desde fuera el puerto responde igual de bien. Por eso
+# estas sondas dicen algo en el idioma del servicio y esperan contestación.
+#
+# Ninguna se autentica ni ejecuta nada: son el saludo más barato de cada
+# protocolo. MQTT se queda a propósito en "tcp": un CONNECT sin credenciales
+# cada ciclo aparecería en el log del broker como intento rechazado.
+
+PREFACIO_H2 = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+SETTINGS_H2 = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"      # SETTINGS vacío
+
+
+def sonda_grpc(s, host):
+    """Saludo HTTP/2. Un gRPC vivo responde con un frame; uno colgado calla."""
+    s.sendall(PREFACIO_H2 + SETTINGS_H2)
+    r = s.recv(9)
+    return len(r) >= 9 and r[3] <= 0x09          # cabecera de frame: tipo válido
+
+
+def sonda_http(s, host):
+    s.sendall(b"HEAD / HTTP/1.1\r\nHost: " + host.encode() +
+              b"\r\nConnection: close\r\nUser-Agent: dependencias-mapper\r\n\r\n")
+    return s.recv(16).startswith(b"HTTP/")
+
+
+def sonda_redis(s, host):
+    s.sendall(b"PING\r\n")
+    r = s.recv(64)
+    return r.startswith((b"+PONG", b"-NOAUTH", b"-ERR"))   # vivo aunque pida clave
+
+
+def sonda_postgres(s, host):
+    """Negociación SSL, no un login: un login falso llenaría el log de la base."""
+    s.sendall(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")        # SSLRequest, código 80877103
+    return s.recv(1) in (b"S", b"N")
+
+
+def sonda_kafka(s, host):
+    cid = b"dependencias-mapper"
+    corr = 0x4D415045
+    cuerpo = struct.pack(">hhi", 18, 0, corr) + struct.pack(">h", len(cid)) + cid
+    s.sendall(struct.pack(">i", len(cuerpo)) + cuerpo)
+    r = s.recv(8)
+    return len(r) >= 8 and struct.unpack(">i", r[4:8])[0] == corr
+
+
+SONDAS = {"grpc": sonda_grpc, "http": sonda_http, "redis": sonda_redis,
+          "postgres": sonda_postgres, "kafka": sonda_kafka}
+
+# La clase que ya deducimos para el icono sirve también para elegir sonda.
+CLASE_SONDA = {"postgres": "postgres", "redis": "redis", "kafka": "kafka",
+               "http": "http", "grpc": "grpc"}
+
+# Último recurso, solo si no sabemos la clase. 1883/8883 explícitos para que no
+# se los coma el rango 8xxx de HTTP.
+PUERTO_SONDA = {"6379": "redis", "5432": "postgres", "9092": "kafka", "9093": "kafka",
+                "80": "http", "443": "http", "3000": "http", "3100": "http",
+                "5000": "http", "1883": "tcp", "8883": "tcp"}
+
+# Verificar el certificado convertiría uno caducado en un falso rojo, y aquí
+# solo preguntamos si hay alguien vivo al otro lado.
+CTX_SONDA = ssl.create_default_context()
+CTX_SONDA.check_hostname = False
+CTX_SONDA.verify_mode = ssl.CERT_NONE
+
+
+def protocolo(a):
+    """Qué sonda usar con este destino: configuración > clase > puerto."""
+    for k in ("%s:%s" % (a["host"], a["puerto"]), a["host"]):
+        if k in PROTOCOLOS:
+            return PROTOCOLOS[k]
+    if a["puerto"] in PROTOCOLO_PUERTO:
+        return PROTOCOLO_PUERTO[a["puerto"]]
+    c = clase(a)
+    if c:                                # sabemos qué es: o hay sonda, o TCP
+        return CLASE_SONDA.get(c, "tcp")
+    if a["puerto"] in PUERTO_SONDA:
+        return PUERTO_SONDA[a["puerto"]]
+    n = int(a["puerto"]) if str(a["puerto"]).isdigit() else 0
+    if 50051 <= n <= 50099:
+        return "grpc"
+    if 8000 <= n <= 8999:
+        return "http"
+    return "tcp"
+
+
+def sondear(addr, puerto, proto="tcp", host=None):
+    """Devuelve (valor, duración, motivo, protocolo usado).
+
+    "sin_respuesta" es el caso que el nivel de red no ve: la conexión se
+    estableció, pero el programa no contestó a su propio protocolo.
+    """
     t0 = time.monotonic()
+    s = None
     try:
-        with socket.create_connection((addr, int(puerto)), timeout=TIMEOUT):
-            pass
-        return 1, time.monotonic() - t0, ""
+        s = socket.create_connection((addr, int(puerto)), timeout=TIMEOUT)
+        if proto == "tcp":
+            return 1, time.monotonic() - t0, "", proto
+        s.settimeout(TIMEOUT)
+        if proto == "http" and str(puerto) in ("443", "8443"):
+            s = CTX_SONDA.wrap_socket(s, server_hostname=host or addr)
+        if SONDAS[proto](s, host or addr):
+            return 1, time.monotonic() - t0, "", proto
+        return 0, time.monotonic() - t0, "sin_respuesta", proto
     except socket.timeout:
-        return 0, TIMEOUT, "timeout"
+        # si ya había conexión, el que calla es el programa, no la red
+        return 0, time.monotonic() - t0, "sin_respuesta" if s else "timeout", proto
     except ConnectionRefusedError:
-        return 0, time.monotonic() - t0, "refused"
+        return 0, time.monotonic() - t0, "refused", proto
+    except ConnectionResetError:
+        return 0, time.monotonic() - t0, "sin_respuesta" if s else "error", proto
     except socket.gaierror:
-        return 0, time.monotonic() - t0, "dns"
+        return 0, time.monotonic() - t0, "dns", proto
+    except ssl.SSLError:
+        return 0, time.monotonic() - t0, "sin_respuesta", proto
     except OSError:
-        return 0, time.monotonic() - t0, "error"
+        return 0, time.monotonic() - t0, "error", proto
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 # ── ciclo principal ──────────────────────────────────────────────────────
@@ -345,8 +465,9 @@ def ciclo():
     pendientes = [k for k, a in destinos.items()
                   if "%s:%s" % (a["host"], k[1]) not in NO_SONDEAR and a["host"] not in NO_SONDEAR]
     sondas = {}
+    argumentos = [(k[0], k[1], protocolo(destinos[k]), destinos[k]["host"]) for k in pendientes]
     with ThreadPoolExecutor(max_workers=16) as ex:
-        for k, r in zip(pendientes, ex.map(lambda k: sondear(*k), pendientes)):
+        for k, r in zip(pendientes, ex.map(lambda x: sondear(*x), argumentos)):
             sondas[k] = r
     with LOCK:
         ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes,
@@ -385,14 +506,15 @@ def metricas():
     for a in sorted(aristas, key=lambda a: (a["src"], a["host"], a["puerto"])):
         k = (direccion(a), a["puerto"])
         valor = sondas[k][0] if k in sondas else 2
+        usada = sondas[k][3] if k in sondas else ""
         dst = alias(a)
         out.append('dependencia{namespace="%s",src="%s",src_id="%s",src_tipo="%s",'
                    'dst="%s",dst_id="%s",dst_svc="%s",dst_addr="%s",dst_port="%s",'
-                   'dst_kind="%s",clave="%s",externo="%s"} %d' % (
+                   'dst_kind="%s",clave="%s",externo="%s",sonda="%s"} %d' % (
                        esc(a["ns"]), esc(a["src"]), nodo_id(a["src"]), esc(a["tipo"]),
                        esc(dst), nodo_id(dst),
                        esc(a["host"] if a["interno"] else ""), esc(a["host"]), esc(a["puerto"]),
-                       esc(clase(a)), esc(a["clave"]), "false" if a["interno"] else "true", valor))
+                       esc(clase(a)), esc(a["clave"]), "false" if a["interno"] else "true", esc(usada), valor))
     out.append("# HELP dependencia_duracion_segundos Tiempo de la sonda TCP al destino.")
     out.append("# TYPE dependencia_duracion_segundos gauge")
     out.append("# HELP dependencia_fallo_motivo Motivo del fallo de sonda: timeout, refused, dns, error.")
@@ -403,11 +525,12 @@ def metricas():
         if k in vistos or k not in sondas:
             continue
         vistos.add(k)
-        ok, dur_sonda, motivo = sondas[k]
+        ok, dur_sonda, motivo, proto_usado = sondas[k]
         dst = esc(alias(a))
         out.append('dependencia_duracion_segundos{dst="%s",dst_port="%s"} %.4f' % (dst, esc(a["puerto"]), dur_sonda))
         if not ok:
-            out.append('dependencia_fallo_motivo{dst="%s",dst_port="%s",motivo="%s"} 1' % (dst, esc(a["puerto"]), motivo))
+            out.append('dependencia_fallo_motivo{dst="%s",dst_port="%s",motivo="%s",sonda="%s"} 1' % (
+                dst, esc(a["puerto"]), motivo, proto_usado))
     out.append("# TYPE dependencia_mapper_info gauge")
     out.append('dependencia_mapper_info{version="%s"} 1' % VERSION)
     out.append("# TYPE dependencia_mapper_ultima_lectura_timestamp_seconds gauge")

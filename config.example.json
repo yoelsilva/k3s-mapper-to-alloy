@@ -20,6 +20,16 @@
 
   "no_sondear": [],
 
+  "_comentario_protocolos": "Fuerza la sonda cuando el puerto no delata el protocolo. Un NodePort 31878 no parece gRPC, pero lo es.",
+  "protocolos": {
+    "10.0.0.10:31878": "grpc",
+    "10.0.0.10:31821": "grpc",
+    "10.0.0.10:32272": "grpc"
+  },
+  "protocolo_por_puerto": {
+    "9000": "http"
+  },
+
   "hosts_ignorar": ["0.0.0.0", "127.0.0.1", "localhost", "::", "::1"],
   "claves_regex": "(HOST|HOSTS|URL|URLS|URI|ADDR|ADDRESS|ENDPOINT|BROKER|BROKERS|SERVER)$",
   "claves_excluir_regex": "(CORS|ORIGIN|ALLOWLIST|WHITELIST|PUBLIC|DOMAIN|THIS_URL|REDIRECT|_WEB_URL$|PORTAL_BASE_URL)",

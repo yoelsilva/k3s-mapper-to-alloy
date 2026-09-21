@@ -29,6 +29,49 @@ Cada `intervalo_segundos`:
 
 Nunca imprime ni exporta valores de variables: solo host, puerto y nombre de la clave.
 
+### Qué comprueba cada sonda
+
+Hay tres niveles, y solo los dos primeros le tocan al mapper:
+
+| Nivel | Pregunta | Quién responde |
+|---|---|---|
+| 1 · red | ¿el puerto acepta conexiones? | el kernel |
+| 2 · protocolo | ¿hay un programa que hable gRPC/HTTP/Redis al otro lado? | el programa |
+| 3 · aplicación | ¿ese programa está sano? | el `readinessProbe` del servicio |
+
+**El nivel 1 miente.** Cuando un programa abre un puerto, es el kernel quien
+completa el saludo TCP y encola la conexión. Si el programa está colgado —en un
+bucle, esperando algo que no llega— el kernel sigue aceptando y desde fuera el
+puerto responde perfectamente. Hasta 0.3.0 el mapper solo hacía eso: conectar y
+cerrar. Un gRPC colgado salía gris.
+
+Desde 0.4.0 las sondas están en el nivel 2: dicen algo en el idioma del servicio
+y esperan contestación.
+
+| `sonda` | Qué envía | Qué acepta como vivo |
+|---|---|---|
+| `grpc` | saludo HTTP/2 + `SETTINGS` | un frame HTTP/2 de vuelta |
+| `http` | `HEAD /` | una respuesta que empiece por `HTTP/` |
+| `redis` | `PING` | `+PONG`, `-NOAUTH` o `-ERR` |
+| `postgres` | petición de negociación SSL | un byte `S` o `N` |
+| `kafka` | petición `ApiVersions` | respuesta con el mismo id de correlación |
+| `tcp` | nada | que la conexión se acepte |
+
+Ninguna se autentica ni ejecuta nada. Para Postgres se eligió la negociación SSL
+en vez de un login falso, que llenaría el log de la base de errores. **MQTT se
+queda en `tcp` a propósito**: un `CONNECT` sin credenciales cada ciclo aparecería
+en el log de EMQX como intento rechazado. Se puede subir con `protocolos`.
+
+El protocolo se elige por configuración (`protocolos`, `protocolo_por_puerto`),
+luego por `dst_kind`, y por último por el puerto (`50051-50099` → gRPC). Un
+NodePort como `31878` no delata nada: ése hay que forzarlo en la configuración.
+
+El nivel 3 no le corresponde al mapper. Si un servicio gRPC tuviera
+`readinessProbe.grpc`, Kubernetes lo sacaría del Service al colgarse, nadie le
+mandaría más tráfico, y el mapper lo vería en rojo por `refused`. Sin esa sonda,
+el servicio sigue recibiendo peticiones reales aunque el mapa ya lo pinte rojo:
+esa parte solo la arregla el propio Deployment.
+
 ### Reglas de detección
 
 Un valor cuenta como dependencia si, tras trocearlo por comas/espacios:
@@ -57,10 +100,11 @@ se deduce del esquema (`https` → 443) o de la clave (`REDIS_*` → 6379, `KAFK
 ### Métricas
 
 ```
-dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_addr,dst_port,dst_kind,clave,externo}
+dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_addr,dst_port,dst_kind,clave,externo,sonda}
     1 = destino alcanzable · 0 = no alcanzable · 2 = en no_sondear
 dependencia_duracion_segundos{dst,dst_port}
-dependencia_fallo_motivo{dst,dst_port,motivo}      motivo: timeout | refused | dns | error
+dependencia_fallo_motivo{dst,dst_port,motivo,sonda}
+    motivo: sin_respuesta | timeout | refused | dns | error
 dependencia_mapper_info{version}
 dependencia_mapper_ultima_lectura_timestamp_seconds
 dependencia_mapper_duracion_ciclo_segundos
@@ -193,8 +237,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.3.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.3.0, :0.3 y :latest
+git tag v0.4.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.4.0, :0.4 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
@@ -210,7 +254,8 @@ pones **público**, k3s lo descarga sin credenciales.
   NetworkPolicy permite `tecopos → brokers` pero no `monitoring → brokers`, la
   flecha sale roja aunque el servicio real llegue. Solución: permitir el
   namespace del mapper en la política, o meter el destino en `no_sondear`.
-- Solo TCP: "el puerto abre". Un servicio HTTP que responde 500 sale gris.
+- Nivel de protocolo, no de aplicación: un servicio que contesta al saludo pero
+  devuelve 500 a todo sale gris. Eso lo cubre el `readinessProbe` del servicio.
 - Solo lee ConfigMaps. Si una dependencia vive en un Secret (p. ej. una
   `DATABASE_URL` completa), no se ve. Es deliberado: mover el host a una variable
   aparte del Secret es la solución correcta, no que el mapper lea Secrets.
