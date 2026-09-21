@@ -29,6 +29,28 @@ Cada `intervalo_segundos`:
 
 Nunca imprime ni exporta valores de variables: solo host, puerto y nombre de la clave.
 
+### Qué significa `externo`
+
+**Sale del clúster**, no "sale del namespace". El namespace es una división
+administrativa, no una frontera de confianza: si `emqx-svc.brokers` se pintara
+igual que un proveedor de pagos en internet, la etiqueta no distinguiría nada.
+
+Desde 0.5.0 el mapper resuelve las referencias cruzadas `servicio.namespace` —y
+sus formas largas `servicio.namespace.svc.cluster.local`— contra un índice de
+los Services de **todo** el clúster. Un destino en otro namespace sale con
+`externo="false"`, su `dst_ns`, y el nombre de su workload dueño si ese
+namespace también se escanea.
+
+Ese índice necesita el ClusterRole de solo lectura sobre Services
+(`deploy/00-rbac.yaml`). Su alcance es deliberadamente estrecho: Services y nada
+más. Sin él el mapper sigue funcionando, pero cae a los namespaces escaneados y
+`externo` vuelve a depender de que la lista `namespaces` esté al día.
+
+Un aviso sobre el cambio: al dejar de ser externo, un nodo pasa de llamarse
+`emqx-svc.brokers` a llamarse `emqx`, **y con ello cambia su `dst_id`**. En un
+panel aparece como un nodo nuevo, no como el mismo renombrado. Es un ejemplo de
+por qué `dst_id` es un id de pantalla y no sirve como clave de correlación.
+
 ### Qué comprueba cada sonda
 
 Hay tres niveles, y solo los dos primeros le tocan al mapper:
@@ -100,7 +122,7 @@ se deduce del esquema (`https` → 443) o de la clave (`REDIS_*` → 6379, `KAFK
 ### Métricas
 
 ```
-dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_addr,dst_port,dst_kind,clave,externo,sonda}
+dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_ns,dst_addr,dst_port,dst_kind,clave,externo,sonda}
     1 = destino alcanzable · 0 = no alcanzable · 2 = en no_sondear
 dependencia_duracion_segundos{dst,dst_port}
 dependencia_fallo_motivo{dst,dst_port,motivo,sonda}
@@ -110,6 +132,7 @@ dependencia_mapper_ultima_lectura_timestamp_seconds
 dependencia_mapper_duracion_ciclo_segundos
 dependencia_mapper_fuentes{tipo}                    deployment | statefulset | configmap | service
 dependencia_mapper_errores_total
+dependencia_mapper_namespace_error{namespace,recurso,motivo}   403 = falta el RoleBinding
 ```
 
 `dst` es el nombre del nodo destino: alias explícito > workload dueño > host.
@@ -237,8 +260,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.4.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.4.0, :0.4 y :latest
+git tag v0.5.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.5.0, :0.5 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
@@ -250,6 +273,8 @@ pones **público**, k3s lo descarga sin credenciales.
 
 ## Limitaciones conocidas
 
+- Un namespace que no se puede leer ya no tumba el ciclo: se anota en
+  `dependencia_mapper_namespace_error` y el resto del mapa se dibuja igual.
 - La sonda sale desde el namespace del mapper, no desde el pod origen. Si una
   NetworkPolicy permite `tecopos → brokers` pero no `monitoring → brokers`, la
   flecha sale roja aunque el servicio real llegue. Solución: permitir el

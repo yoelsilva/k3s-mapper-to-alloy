@@ -25,6 +25,38 @@ rules:
     resources: ["configmaps", "services"]
     verbs: ["get", "list"]
 ---
+# Solo Services, de todo el clúster. Es lo que permite saber que un destino como
+# `emqx-svc.brokers` está DENTRO del clúster aunque `brokers` no se escanee.
+#
+# Sin esto el mapper sigue funcionando, pero `externo` vuelve a depender de que
+# la lista `namespaces` esté al día: un Service de un namespace no listado se
+# marcaría como externo, igual que un proveedor de internet, y esa es justo la
+# distinción que hace útil la etiqueta.
+#
+# El alcance es deliberadamente estrecho: Services y nada más. Ni ConfigMaps
+# (que pueden llevar datos), ni workloads, ni por supuesto Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dependencias-mapper-servicios
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dependencias-mapper-servicios
+subjects:
+  - kind: ServiceAccount
+    name: dependencias-mapper
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: dependencias-mapper-servicios
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

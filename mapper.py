@@ -39,11 +39,12 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def log(*a):
@@ -146,10 +147,17 @@ CLASE_CLAVE = [("POSTGRES", "postgres"), ("MYSQL", "mysql"), ("MONGO", "mongo"),
 
 # ── extracción de dependencias ───────────────────────────────────────────
 def normalizar(host, ns):
+    """Reduce el host a `servicio` o a `servicio.namespace`.
+
+    Las formas largas del DNS de Kubernetes se recortan: la del propio
+    namespace queda en `servicio`, la de otro queda en `servicio.namespace`.
+    Quién es quién lo decide después clasificar(), con el índice del clúster.
+    """
     h = host.strip().lower().rstrip(".")
-    for suf in (".%s.svc.cluster.local" % ns, ".%s.svc" % ns, ".svc.cluster.local"):
+    for suf in (".%s.svc.cluster.local" % ns, ".%s.svc" % ns,
+                ".svc.cluster.local", ".svc"):
         if h.endswith(suf):
-            h = h[:-len(suf)]
+            return h[:-len(suf)]
     return h
 
 
@@ -229,65 +237,147 @@ def extraer(data, servicios, ns):
     return deps
 
 
+def leer(path, ns, recurso, errores):
+    """api_get que no tumba el ciclo: anota el fallo y devuelve None.
+
+    Antes, un 403 en un solo namespace abortaba el ciclo entero y dejaba el
+    mapa vacío, incluidos los namespaces que sí se podían leer.
+    """
+    try:
+        return api_get(path)
+    except urllib.error.HTTPError as e:
+        errores.append((ns, recurso, str(e.code)))
+    except Exception as e:                            # red, DNS, JSON roto
+        errores.append((ns, recurso, type(e).__name__))
+    return None
+
+
+def indice_servicios(errores):
+    """{servicio: {namespace, ...}} de TODOS los Services del clúster.
+
+    Es lo que permite saber que `emqx-svc.brokers` es interno aunque `brokers`
+    no esté en la lista de namespaces. Necesita el ClusterRole de solo lectura
+    sobre Services (deploy/00-rbac.yaml); sin él se cae a los namespaces
+    escaneados, y entonces `externo` vuelve a depender de que la lista esté al
+    día, que es justo la fragilidad que este índice viene a quitar.
+    """
+    indice = {}
+    todos = leer("/api/v1/services", "*", "services", errores)
+    if todos is None:
+        return indice, False
+    for s in todos:
+        indice.setdefault(s["metadata"]["name"], set()).add(s["metadata"]["namespace"])
+    return indice, True
+
+
+def clasificar(host, ns, indice):
+    """(interno, namespace destino, servicio) del destino.
+
+    `interno` significa "está dentro del clúster", no "está en mi namespace":
+    el namespace es una división administrativa, no una frontera de confianza.
+    Un Service de otro namespace es tan interno como el de al lado.
+    """
+    if ns in indice.get(host, ()):
+        return True, ns, host
+    if "." in host:
+        svc, _, resto = host.partition(".")
+        if resto in indice.get(svc, ()):              # forma servicio.namespace
+            return True, resto, svc
+    return False, None, None
+
+
 def leer_topologia():
     aristas = []
     fuentes = {"deployment": 0, "statefulset": 0, "configmap": 0, "service": 0}
+    errores = []
+    indice, global_ok = indice_servicios(errores)
+
+    dueno = {}          # (namespace, servicio) -> workload dueño
+    pendientes = []     # (ns, servicios del ns, cms, tipo, workload)
+
     for ns in NAMESPACES:
-        servicios_raw = api_get("/api/v1/namespaces/%s/services" % ns)
+        servicios_raw = leer("/api/v1/namespaces/%s/services" % ns, ns, "services", errores)
+        if servicios_raw is None:
+            continue                                  # este namespace se cae solo
         servicios = {s["metadata"]["name"] for s in servicios_raw}
         selectores = {s["metadata"]["name"]: (s.get("spec", {}).get("selector") or {})
                       for s in servicios_raw}
         fuentes["service"] += len(servicios)
-        cms = {c["metadata"]["name"]: c.get("data", {}) or {}
-               for c in api_get("/api/v1/namespaces/%s/configmaps" % ns)}
+        if not global_ok:                             # sin ClusterRole, al menos lo escaneado
+            for nombre_svc in servicios:
+                indice.setdefault(nombre_svc, set()).add(ns)
+
+        cms_raw = leer("/api/v1/namespaces/%s/configmaps" % ns, ns, "configmaps", errores) or []
+        cms = {c["metadata"]["name"]: c.get("data", {}) or {} for c in cms_raw}
         fuentes["configmap"] += len(cms)
-        cargas = [("deployment", w) for w in api_get("/apis/apps/v1/namespaces/%s/deployments" % ns)] + \
-                 [("statefulset", w) for w in api_get("/apis/apps/v1/namespaces/%s/statefulsets" % ns)]
+
+        cargas = []
+        for tipo, ruta in (("deployment", "/apis/apps/v1/namespaces/%s/deployments"),
+                           ("statefulset", "/apis/apps/v1/namespaces/%s/statefulsets")):
+            for w in (leer(ruta % ns, ns, tipo + "s", errores) or []):
+                cargas.append((tipo, w))
 
         # Service -> workload dueño: el selector del Service coincide con las labels del pod
-        dueno = {}
         for tipo, w in cargas:
             etiquetas = w["spec"]["template"].get("metadata", {}).get("labels", {}) or {}
             for svc, sel in selectores.items():
                 if sel and all(etiquetas.get(k) == v for k, v in sel.items()):
-                    dueno.setdefault(svc, w["metadata"]["name"])
+                    dueno.setdefault((ns, svc), w["metadata"]["name"])
 
         for tipo, w in cargas:
             fuentes[tipo] += 1
-            nombre = w["metadata"]["name"]
-            datos = {}
-            for c in w["spec"]["template"]["spec"].get("containers", []):
-                for e in c.get("envFrom", []):
-                    ref = e.get("configMapRef", {}).get("name")
-                    if ref:
-                        datos.update(cms.get(ref, {}))
-                for e in c.get("env", []):
-                    if "value" in e:
-                        datos[e["name"]] = e["value"]
-                    ref = e.get("valueFrom", {}).get("configMapKeyRef")
-                    if ref:
-                        datos[e["name"]] = cms.get(ref["name"], {}).get(ref["key"], "")
-            for (host, puerto), (clave, esquema) in extraer(datos, servicios, ns).items():
-                if host.startswith(nombre) or dueno.get(host) == nombre:
-                    continue                # no me apunto a mí mismo
-                aristas.append({"ns": ns, "src": nombre, "tipo": tipo,
-                                "host": host, "puerto": puerto, "clave": clave, "esquema": esquema,
-                                "interno": host in servicios, "dueno": dueno.get(host)})
-    return aristas, fuentes
+            pendientes.append((ns, servicios, cms, tipo, w))
+
+    # Segunda pasada: los dueños de todos los namespaces ya están resueltos, así
+    # que una flecha a otro namespace puede nombrar su workload destino.
+    for ns, servicios, cms, tipo, w in pendientes:
+        nombre = w["metadata"]["name"]
+        datos = {}
+        for c in w["spec"]["template"]["spec"].get("containers", []):
+            for e in c.get("envFrom", []):
+                ref = e.get("configMapRef", {}).get("name")
+                if ref:
+                    datos.update(cms.get(ref, {}))
+            for e in c.get("env", []):
+                if "value" in e:
+                    datos[e["name"]] = e["value"]
+                ref = e.get("valueFrom", {}).get("configMapKeyRef")
+                if ref:
+                    datos[e["name"]] = cms.get(ref["name"], {}).get(ref["key"], "")
+        for (host, puerto), (clave, esquema) in extraer(datos, servicios, ns).items():
+            interno, ns_dst, svc = clasificar(host, ns, indice)
+            dueno_dst = dueno.get((ns_dst, svc)) if interno else None
+            if host.startswith(nombre) or (dueno_dst == nombre and ns_dst == ns):
+                continue                              # no me apunto a mí mismo
+            aristas.append({"ns": ns, "src": nombre, "tipo": tipo,
+                            "host": host, "puerto": puerto, "clave": clave, "esquema": esquema,
+                            "interno": interno, "ns_dst": ns_dst, "svc": svc,
+                            "dueno": dueno_dst})
+    return aristas, fuentes, errores
 
 
 # ── sondas ───────────────────────────────────────────────────────────────
 def direccion(a):
-    """Dirección que resuelve desde el namespace del mapper."""
-    return "%s.%s.svc.cluster.local" % (a["host"], a["ns"]) if a["interno"] else a["host"]
+    """Dirección que resuelve desde el namespace del mapper.
+
+    Para lo interno se usa siempre la forma larga con su propio namespace, que
+    resuelve desde cualquier sitio del clúster.
+    """
+    if a["interno"]:
+        return "%s.%s.svc.cluster.local" % (a["svc"], a["ns_dst"])
+    return a["host"]
 
 
 def alias(a):
-    """Nombre del nodo destino: alias explícito > workload dueño > host."""
+    """Nombre del nodo destino: alias explícito > dueño > Service > host.
+
+    El Service entra en la cadena porque un destino interno de un namespace que
+    no escaneamos se conoce por su nombre de Service, pero no su dueño.
+    """
     expl = ALIAS.get("%s:%s" % (a["host"], a["puerto"]), ALIAS.get(a["host"]))
     if expl:
         return expl
-    return a.get("dueno") or a["host"]
+    return a.get("dueno") or a.get("svc") or a["host"]
 
 
 def clase(a):
@@ -452,13 +542,14 @@ def sondear(addr, puerto, proto="tcp", host=None):
 
 
 # ── ciclo principal ──────────────────────────────────────────────────────
-ESTADO = {"aristas": [], "sondas": {}, "fuentes": {}, "ts": 0, "errores": 0, "duracion_ciclo": 0}
+ESTADO = {"aristas": [], "sondas": {}, "fuentes": {}, "ts": 0, "errores": 0,
+          "duracion_ciclo": 0, "errores_ns": []}
 LOCK = threading.Lock()
 
 
 def ciclo():
     t0 = time.monotonic()
-    aristas, fuentes = leer_topologia()
+    aristas, fuentes, errores_ns = leer_topologia()
     destinos = {}
     for a in aristas:
         destinos[(direccion(a), a["puerto"])] = a
@@ -470,11 +561,13 @@ def ciclo():
         for k, r in zip(pendientes, ex.map(lambda x: sondear(*x), argumentos)):
             sondas[k] = r
     with LOCK:
-        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes,
+        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns,
                       ts=time.time(), duracion_ciclo=time.monotonic() - t0)
     rojos = sum(1 for r in sondas.values() if r[0] == 0)
     log("ciclo ok: %d flechas, %d destinos, %d en rojo, %.1fs" % (len(aristas), len(destinos), rojos,
                                                                   time.monotonic() - t0))
+    for ns, recurso, motivo in errores_ns:
+        log("  sin acceso: namespace=%s recurso=%s motivo=%s" % (ns, recurso, motivo))
 
 
 def bucle():
@@ -498,6 +591,7 @@ def metricas():
         aristas = list(ESTADO["aristas"])
         sondas = dict(ESTADO["sondas"])
         fuentes = dict(ESTADO["fuentes"])
+        errores_ns = list(ESTADO["errores_ns"])
         ts, errores, dur = ESTADO["ts"], ESTADO["errores"], ESTADO["duracion_ciclo"]
     out = [
         "# HELP dependencia Flecha declarada. 1 destino alcanzable, 0 no alcanzable, 2 no sondeado.",
@@ -509,11 +603,12 @@ def metricas():
         usada = sondas[k][3] if k in sondas else ""
         dst = alias(a)
         out.append('dependencia{namespace="%s",src="%s",src_id="%s",src_tipo="%s",'
-                   'dst="%s",dst_id="%s",dst_svc="%s",dst_addr="%s",dst_port="%s",'
+                   'dst="%s",dst_id="%s",dst_svc="%s",dst_ns="%s",dst_addr="%s",dst_port="%s",'
                    'dst_kind="%s",clave="%s",externo="%s",sonda="%s"} %d' % (
                        esc(a["ns"]), esc(a["src"]), nodo_id(a["src"]), esc(a["tipo"]),
                        esc(dst), nodo_id(dst),
-                       esc(a["host"] if a["interno"] else ""), esc(a["host"]), esc(a["puerto"]),
+                       esc(a.get("svc") or ""), esc(a.get("ns_dst") or ""),
+                       esc(a["host"]), esc(a["puerto"]),
                        esc(clase(a)), esc(a["clave"]), "false" if a["interno"] else "true", esc(usada), valor))
     out.append("# HELP dependencia_duracion_segundos Tiempo de la sonda TCP al destino.")
     out.append("# TYPE dependencia_duracion_segundos gauge")
@@ -542,6 +637,12 @@ def metricas():
         out.append('dependencia_mapper_fuentes{tipo="%s"} %d' % (tipo, n))
     out.append("# TYPE dependencia_mapper_errores_total counter")
     out.append("dependencia_mapper_errores_total %d" % errores)
+    out.append("# HELP dependencia_mapper_namespace_error Recurso que el mapper no pudo leer. "
+               "motivo: codigo HTTP (403 = falta el RoleBinding) o tipo de excepcion.")
+    out.append("# TYPE dependencia_mapper_namespace_error gauge")
+    for ns, recurso, motivo in errores_ns:
+        out.append('dependencia_mapper_namespace_error{namespace="%s",recurso="%s",motivo="%s"} 1'
+                   % (esc(ns), esc(recurso), esc(motivo)))
     return "\n".join(out) + "\n"
 
 
