@@ -14,7 +14,8 @@ expone como métricas Prometheus.
      el nodo "controlserver" en el grafo.
   4. Sondea por TCP cada destino:puerto distinto (deduplicado) y expone:
 
-       dependencia{src,dst,dst_svc,dst_addr,dst_port,clave,externo}  1 ok | 0 fallo | 2 no sondeado
+       dependencia{src,dst,dst_svc,dst_ns,dst_addr,dst_port,dst_kind,
+                  clave,externo,sonda,relacion,hosts}   1 ok | 0 fallo | 2 no sondeado
        dependencia_duracion_segundos{dst,dst_port}
        dependencia_fallo_motivo{dst,dst_port,motivo}  1
        dependencia_mapper_*                            salud del propio mapper
@@ -44,7 +45,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 def log(*a):
@@ -286,6 +287,99 @@ def clasificar(host, ns, indice):
     return False, None, None
 
 
+# ── entrada de tráfico: Gateway API ──────────────────────────────────────
+# Todo se descubre por TIPO de recurso estándar, nunca por nombre: si mañana se
+# cambia Envoy Gateway por otra implementación de Gateway API, esto sigue
+# funcionando sin tocar nada.
+GW_API = "/apis/gateway.networking.k8s.io/v1"
+SIN_GATEWAY_API = set()          # para no repetir el aviso en cada ciclo
+
+
+def leer_gw(recurso, errores):
+    """Lista un recurso de Gateway API distinguiendo "no instalado" de "sin permiso".
+
+    Un 404 significa que el CRD no está: este clúster no usa Gateway API. No es
+    un fallo, se dice una vez y se sigue. Un 403 sí lo es, y se anota como
+    cualquier otro para que se vea en `dependencia_mapper_namespace_error`.
+    """
+    try:
+        return api_get("%s/%s" % (GW_API, recurso))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            if recurso not in SIN_GATEWAY_API:
+                SIN_GATEWAY_API.add(recurso)
+                log("Gateway API no instalado (%s): no se dibuja la entrada de tráfico" % recurso)
+            return None
+        errores.append(("*", recurso, str(e.code)))
+    except Exception as e:
+        errores.append(("*", recurso, type(e).__name__))
+    return None
+
+
+def ref_ns(ref, por_defecto):
+    """Namespace de una referencia. Ausente significa el del objeto que la hace,
+    no el del Gateway: equivocarse aquí pierde flechas o las inventa."""
+    return ref.get("namespace") or por_defecto
+
+
+def entrada_trafico(dueno, errores):
+    """Flechas de entrada: internet → Gateway → backend de cada ruta."""
+    gateways = leer_gw("gateways", errores)
+    if gateways is None:
+        return []
+    rutas = leer_gw("httproutes", errores) or []
+    porgw = {(g["metadata"]["namespace"], g["metadata"]["name"]): g for g in gateways}
+    aristas = []
+
+    # internet → Gateway, un destino por puerto de listener.
+    for (gns, gnombre), g in porgw.items():
+        direcciones = [d.get("value") for d in (g.get("status", {}).get("addresses") or [])
+                       if d.get("value")]
+        puertos = sorted({str(l["port"]) for l in (g.get("spec", {}).get("listeners") or [])
+                          if l.get("port")})
+        for addr in (direcciones or [gnombre]):
+            for p in puertos:
+                aristas.append({
+                    "ns": gns, "src": "internet", "tipo": "internet",
+                    "host": addr, "puerto": p, "esquema": None,
+                    "clave": "Gateway %s/%s" % (gns, gnombre),
+                    # el destino es el Gateway, que está DENTRO del clúster
+                    "interno": True, "ns_dst": gns, "svc": None, "dueno": None,
+                    "dst_nombre": gnombre, "relacion": "enruta", "hosts": "",
+                    # sondear la IP pública propia desde dentro depende del hairpin,
+                    # y en muchos proveedores no lo hace: mejor "no sondeado" que un rojo falso
+                    "sondar": False,
+                })
+
+    # Gateway → backend, una fila por backendRef de cada ruta que le cuelgue.
+    for r in rutas:
+        rns, rnombre = r["metadata"]["namespace"], r["metadata"]["name"]
+        spec = r.get("spec", {}) or {}
+        hosts = ",".join(spec.get("hostnames") or [])
+        for p in (spec.get("parentRefs") or []):
+            if (p.get("kind") or "Gateway") != "Gateway":
+                continue
+            gclave = (ref_ns(p, rns), p.get("name"))
+            if gclave not in porgw:
+                continue
+            gns, gnombre = gclave
+            for regla in (spec.get("rules") or []):
+                for b in (regla.get("backendRefs") or []):
+                    if (b.get("kind") or "Service") != "Service" or not b.get("port"):
+                        continue                    # otro kind: no inventamos destino
+                    bns, bnombre = ref_ns(b, rns), b.get("name")
+                    aristas.append({
+                        "ns": gns, "src": gnombre, "tipo": "gateway",
+                        "host": bnombre if bns == gns else "%s.%s" % (bnombre, bns),
+                        "puerto": str(b["port"]), "esquema": None,
+                        "clave": "HTTPRoute %s/%s" % (rns, rnombre),
+                        "interno": True, "ns_dst": bns, "svc": bnombre,
+                        "dueno": dueno.get((bns, bnombre)), "dst_nombre": None,
+                        "relacion": "enruta", "hosts": hosts, "sondar": True,
+                    })
+    return aristas
+
+
 def leer_topologia():
     aristas = []
     fuentes = {"deployment": 0, "statefulset": 0, "configmap": 0, "service": 0}
@@ -353,6 +447,8 @@ def leer_topologia():
                             "host": host, "puerto": puerto, "clave": clave, "esquema": esquema,
                             "interno": interno, "ns_dst": ns_dst, "svc": svc,
                             "dueno": dueno_dst})
+
+    aristas.extend(entrada_trafico(dueno, errores))
     return aristas, fuentes, errores
 
 
@@ -363,7 +459,7 @@ def direccion(a):
     Para lo interno se usa siempre la forma larga con su propio namespace, que
     resuelve desde cualquier sitio del clúster.
     """
-    if a["interno"]:
+    if a["interno"] and a.get("svc"):
         return "%s.%s.svc.cluster.local" % (a["svc"], a["ns_dst"])
     return a["host"]
 
@@ -377,7 +473,9 @@ def alias(a):
     expl = ALIAS.get("%s:%s" % (a["host"], a["puerto"]), ALIAS.get(a["host"]))
     if expl:
         return expl
-    return a.get("dueno") or a.get("svc") or a["host"]
+    # dst_nombre lo fija quien construye la arista cuando el destino no es un
+    # Service: hoy solo internet -> Gateway, donde el destino es el Gateway.
+    return a.get("dst_nombre") or a.get("dueno") or a.get("svc") or a["host"]
 
 
 def clase(a):
@@ -554,7 +652,8 @@ def ciclo():
     for a in aristas:
         destinos[(direccion(a), a["puerto"])] = a
     pendientes = [k for k, a in destinos.items()
-                  if "%s:%s" % (a["host"], k[1]) not in NO_SONDEAR and a["host"] not in NO_SONDEAR]
+                  if a.get("sondar", True)
+                  and "%s:%s" % (a["host"], k[1]) not in NO_SONDEAR and a["host"] not in NO_SONDEAR]
     sondas = {}
     argumentos = [(k[0], k[1], protocolo(destinos[k]), destinos[k]["host"]) for k in pendientes]
     with ThreadPoolExecutor(max_workers=16) as ex:
@@ -604,12 +703,16 @@ def metricas():
         dst = alias(a)
         out.append('dependencia{namespace="%s",src="%s",src_id="%s",src_tipo="%s",'
                    'dst="%s",dst_id="%s",dst_svc="%s",dst_ns="%s",dst_addr="%s",dst_port="%s",'
-                   'dst_kind="%s",clave="%s",externo="%s",sonda="%s"} %d' % (
+                   'dst_kind="%s",clave="%s",externo="%s",sonda="%s",'
+                   'relacion="%s",hosts="%s"} %d' % (
                        esc(a["ns"]), esc(a["src"]), nodo_id(a["src"]), esc(a["tipo"]),
                        esc(dst), nodo_id(dst),
                        esc(a.get("svc") or ""), esc(a.get("ns_dst") or ""),
                        esc(a["host"]), esc(a["puerto"]),
-                       esc(clase(a)), esc(a["clave"]), "false" if a["interno"] else "true", esc(usada), valor))
+                       esc(clase(a)), esc(a["clave"]), "false" if a["interno"] else "true", esc(usada),
+                       # vacía en las flechas de siempre: Prometheus la descarta y
+                       # las series existentes conservan su identidad
+                       esc(a.get("relacion") or ""), esc(a.get("hosts") or ""), valor))
     out.append("# HELP dependencia_duracion_segundos Tiempo de la sonda TCP al destino.")
     out.append("# TYPE dependencia_duracion_segundos gauge")
     out.append("# HELP dependencia_fallo_motivo Motivo del fallo de sonda: timeout, refused, dns, error.")

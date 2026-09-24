@@ -57,6 +57,35 @@ roleRef:
   name: dependencias-mapper-servicios
   apiGroup: rbac.authorization.k8s.io
 ---
+# Entrada de tráfico (Gateway API). Opcional: si el clúster no tiene Gateway API
+# instalado, el mapper lo detecta por el 404 del CRD, lo dice una vez en el log
+# y sigue sin dibujar la entrada. Si lo tiene pero falta este permiso, el 403 sí
+# aparece en `dependencia_mapper_namespace_error`.
+#
+# Las rutas viven en varios namespaces (y apuntan a backends de otros), así que
+# a nivel de namespace no basta. Solo lectura, y solo estos dos recursos.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dependencias-mapper-entrada
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dependencias-mapper-entrada
+subjects:
+  - kind: ServiceAccount
+    name: dependencias-mapper
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: dependencias-mapper-entrada
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

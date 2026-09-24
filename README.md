@@ -29,6 +29,48 @@ Cada `intervalo_segundos`:
 
 Nunca imprime ni exporta valores de variables: solo host, puerto y nombre de la clave.
 
+### La entrada de tráfico
+
+Desde 0.6.0 el mapa no empieza en los workloads: empieza en internet. Si el
+clúster usa **Gateway API**, el mapper lee los `Gateway` y `HTTPRoute` y dibuja
+por dónde entra el tráfico.
+
+```
+internet ──443──▶ main ──app.example.com──▶ gateway
+                   │ ───mqtt.example.com──▶ emqx
+```
+
+Dos etiquetas nuevas lo distinguen de una llamada normal:
+
+| Etiqueta | Valores | Cuándo |
+|---|---|---|
+| `relacion` | `enruta` · (vacía) | Vacía en las flechas de siempre, para que sus series no cambien |
+| `hosts` | hostnames separados por coma | Solo en `enruta`, y solo si la ruta declara alguno |
+
+Y `src_tipo` gana `gateway` e `internet`.
+
+**Todo se descubre por tipo de recurso, nunca por nombre.** Si mañana se cambia
+Envoy Gateway por otra implementación de Gateway API, esto sigue funcionando sin
+tocar la configuración. No hay nada que configurar.
+
+Detalles que importan:
+
+- Una ruta sin `backendRefs` —la típica que solo redirige de HTTP a HTTPS— no
+  genera ninguna fila. Un `backendRef` que no sea un Service tampoco: no se
+  inventa un destino.
+- `parentRefs[].namespace` y `backendRefs[].namespace` ausentes significan **el
+  namespace de la ruta**, no el del Gateway. Equivocarse ahí pierde flechas.
+- `clave` pasa a significar "qué declaró esta flecha": una variable de entorno
+  en las llamadas, y `HTTPRoute <ns>/<nombre>` en las rutas.
+- **La flecha internet → Gateway no se sondea**, sale con `Value=2`. Sondear la
+  IP pública del propio Gateway desde dentro del clúster depende de que la red
+  haga *hairpin*, y en muchos proveedores no lo hace: un rojo permanente en la
+  arista de entrada sería el peor falso positivo posible.
+- Sin Gateway API instalado, el 404 del CRD se dice una vez en el log y se sigue.
+  No cuenta como error. Un 403 sí, y sale en `dependencia_mapper_namespace_error`.
+- `TLSRoute` sigue en `v1alpha2` y todavía no se lee; `Gateway` y `HTTPRoute`
+  están en `v1`.
+
 ### Qué significa `externo`
 
 **Sale del clúster**, no "sale del namespace". El namespace es una división
@@ -122,7 +164,7 @@ se deduce del esquema (`https` → 443) o de la clave (`REDIS_*` → 6379, `KAFK
 ### Métricas
 
 ```
-dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_ns,dst_addr,dst_port,dst_kind,clave,externo,sonda}
+dependencia{namespace,src,src_id,src_tipo,dst,dst_id,dst_svc,dst_ns,dst_addr,dst_port,dst_kind,clave,externo,sonda,relacion,hosts}
     1 = destino alcanzable · 0 = no alcanzable · 2 = en no_sondear
 dependencia_duracion_segundos{dst,dst_port}
 dependencia_fallo_motivo{dst,dst_port,motivo,sonda}
@@ -260,8 +302,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.5.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.5.0, :0.5 y :latest
+git tag v0.6.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.6.0, :0.6 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
