@@ -44,7 +44,7 @@ Dos etiquetas nuevas lo distinguen de una llamada normal:
 
 | Etiqueta | Valores | Cuándo |
 |---|---|---|
-| `relacion` | `enruta` · (vacía) | Vacía en las flechas de siempre, para que sus series no cambien |
+| `relacion` | `enruta` · `expone` · (vacía) | Vacía en las flechas de siempre, para que sus series no cambien |
 | `hosts` | hostnames separados por coma | Solo en `enruta`, y solo si la ruta declara alguno |
 
 Y `src_tipo` gana `gateway` e `internet`.
@@ -70,6 +70,31 @@ Detalles que importan:
   No cuenta como error. Un 403 sí, y sale en `dependencia_mapper_namespace_error`.
 - `TLSRoute` sigue en `v1alpha2` y todavía no se lee; `Gateway` y `HTTPRoute`
   están en `v1`.
+
+#### Dos maneras de entrar
+
+Desde 0.7.0 hay dos ramas desde `internet`, y el mapa es un árbol que empieza ahí:
+
+| `relacion` | Camino | De dónde sale |
+|---|---|---|
+| `enruta` | por el Gateway | `Gateway` y `HTTPRoute` |
+| `expone` | directa, sin Gateway | Services `NodePort` y `LoadBalancer` |
+
+Una fila `expone` por cada puerto abierto al exterior. En `LoadBalancer` se entra
+por el puerto del servicio y `dst_addr` lleva la IP del balanceador; en `NodePort`
+se entra por el `nodePort` y **`dst_addr` va vacío**, porque no hay una dirección
+única: responde en la IP de todos los nodos.
+
+El destino se resuelve a su workload dueño igual que cualquier otro, así que las
+llamadas internas a un NodePort y su exposición a internet acaban en el mismo
+nodo del grafo. **Por eso no hay que ponerle alias a un NodePort**: partiría ese
+nodo en dos.
+
+El `LoadBalancer` del propio Gateway se excluye —su entrada ya la dibuja
+`enruta`— y se reconoce porque su dirección coincide con la del Gateway, nunca
+por su nombre, que cada implementación se inventa a su manera.
+
+No hace falta ningún permiso nuevo: se apoya en el ClusterRole de Services.
 
 ### Qué significa `externo`
 
@@ -302,8 +327,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.6.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.6.0, :0.6 y :latest
+git tag v0.7.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.7.0, :0.7 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.

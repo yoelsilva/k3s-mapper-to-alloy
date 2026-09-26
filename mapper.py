@@ -45,7 +45,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 def log(*a):
@@ -265,10 +265,10 @@ def indice_servicios(errores):
     indice = {}
     todos = leer("/api/v1/services", "*", "services", errores)
     if todos is None:
-        return indice, False
+        return indice, False, []
     for s in todos:
         indice.setdefault(s["metadata"]["name"], set()).add(s["metadata"]["namespace"])
-    return indice, True
+    return indice, True, todos
 
 
 def clasificar(host, ns, indice):
@@ -322,34 +322,49 @@ def ref_ns(ref, por_defecto):
     return ref.get("namespace") or por_defecto
 
 
+def direccion_gateway(g):
+    """La dirección pública del Gateway. Se prefiere la IP si declara varias."""
+    addrs = [d for d in (g.get("status", {}).get("addresses") or []) if d.get("value")]
+    ips = [d["value"] for d in addrs if d.get("type") == "IPAddress"]
+    return (ips or [d["value"] for d in addrs] or [""])[0]
+
+
 def entrada_trafico(dueno, errores):
-    """Flechas de entrada: internet → Gateway → backend de cada ruta."""
+    """Flechas de entrada: internet → Gateway → backend de cada ruta.
+
+    Devuelve (aristas, direcciones de los Gateway), que hacen falta después
+    para no contar dos veces el LoadBalancer del propio Gateway.
+    """
     gateways = leer_gw("gateways", errores)
     if gateways is None:
-        return []
+        return [], set()
     rutas = leer_gw("httproutes", errores) or []
     porgw = {(g["metadata"]["namespace"], g["metadata"]["name"]): g for g in gateways}
     aristas = []
+    direcciones_gw = set()
 
-    # internet → Gateway, un destino por puerto de listener.
+    # internet → Gateway, UNA fila por puerto de listener. Un Gateway puede
+    # declarar varias direcciones (IP y hostname); si se emitiera una fila por
+    # cada una, el grafo pintaría la misma arista repetida.
     for (gns, gnombre), g in porgw.items():
-        direcciones = [d.get("value") for d in (g.get("status", {}).get("addresses") or [])
-                       if d.get("value")]
+        addr = direccion_gateway(g)
+        for d in (g.get("status", {}).get("addresses") or []):
+            if d.get("value"):
+                direcciones_gw.add(d["value"])
         puertos = sorted({str(l["port"]) for l in (g.get("spec", {}).get("listeners") or [])
                           if l.get("port")})
-        for addr in (direcciones or [gnombre]):
-            for p in puertos:
-                aristas.append({
-                    "ns": gns, "src": "internet", "tipo": "internet",
-                    "host": addr, "puerto": p, "esquema": None,
-                    "clave": "Gateway %s/%s" % (gns, gnombre),
-                    # el destino es el Gateway, que está DENTRO del clúster
-                    "interno": True, "ns_dst": gns, "svc": None, "dueno": None,
-                    "dst_nombre": gnombre, "relacion": "enruta", "hosts": "",
-                    # sondear la IP pública propia desde dentro depende del hairpin,
-                    # y en muchos proveedores no lo hace: mejor "no sondeado" que un rojo falso
-                    "sondar": False,
-                })
+        for p in puertos:
+            aristas.append({
+                "ns": gns, "src": "internet", "tipo": "internet",
+                "host": addr or gnombre, "puerto": p, "esquema": None,
+                "clave": "Gateway %s/%s" % (gns, gnombre),
+                # el destino es el Gateway, que está DENTRO del clúster
+                "interno": True, "ns_dst": gns, "svc": None, "dueno": None,
+                "dst_nombre": gnombre, "relacion": "enruta", "hosts": "",
+                # sondear la IP pública propia desde dentro depende del hairpin,
+                # y en muchos proveedores no lo hace: mejor "no sondeado" que un rojo falso
+                "sondar": False,
+            })
 
     # Gateway → backend, una fila por backendRef de cada ruta que le cuelgue.
     for r in rutas:
@@ -377,6 +392,50 @@ def entrada_trafico(dueno, errores):
                         "dueno": dueno.get((bns, bnombre)), "dst_nombre": None,
                         "relacion": "enruta", "hosts": hosts, "sondar": True,
                     })
+    return aristas, direcciones_gw
+
+
+def expuestos(servicios, dueno, direcciones_gw):
+    """Flechas internet → servicio para lo abierto al exterior sin Gateway.
+
+    La otra manera de llegar a un servicio desde fuera: un Service de tipo
+    NodePort o LoadBalancer. Se excluye el LoadBalancer del propio Gateway,
+    cuya entrada ya dibuja `enruta`; se reconoce porque su dirección coincide
+    con la del Gateway, no por su nombre, que cada implementación se inventa.
+    """
+    aristas = []
+    for s in servicios:
+        spec = s.get("spec", {}) or {}
+        tipo = spec.get("type")
+        if tipo not in ("NodePort", "LoadBalancer"):
+            continue
+        ns, nombre = s["metadata"]["namespace"], s["metadata"]["name"]
+
+        direcciones = [i.get("ip") or i.get("hostname")
+                       for i in ((s.get("status", {}).get("loadBalancer") or {}).get("ingress") or [])
+                       if i.get("ip") or i.get("hostname")]
+        if direcciones_gw.intersection(direcciones):
+            continue                                  # es el LoadBalancer del Gateway
+
+        for p in (spec.get("ports") or []):
+            # En LoadBalancer se entra por el puerto del servicio, en la IP del
+            # balanceador. En NodePort se entra por el nodePort, y no hay una
+            # dirección única: responde en la IP de todos los nodos.
+            if tipo == "LoadBalancer":
+                puerto, host = p.get("port"), (direcciones[0] if direcciones else "")
+            else:
+                puerto, host = p.get("nodePort"), ""
+            if not puerto:
+                continue
+            aristas.append({
+                "ns": ns, "src": "internet", "tipo": "internet",
+                "host": host, "puerto": str(puerto), "esquema": None,
+                "clave": "Service %s/%s" % (ns, nombre),
+                "interno": True, "ns_dst": ns, "svc": nombre,
+                "dueno": dueno.get((ns, nombre)), "dst_nombre": None,
+                "relacion": "expone", "hosts": "",
+                "sondar": False,                       # mismo motivo que el Gateway
+            })
     return aristas
 
 
@@ -384,7 +443,7 @@ def leer_topologia():
     aristas = []
     fuentes = {"deployment": 0, "statefulset": 0, "configmap": 0, "service": 0}
     errores = []
-    indice, global_ok = indice_servicios(errores)
+    indice, global_ok, servicios_objetos = indice_servicios(errores)
 
     dueno = {}          # (namespace, servicio) -> workload dueño
     pendientes = []     # (ns, servicios del ns, cms, tipo, workload)
@@ -400,6 +459,7 @@ def leer_topologia():
         if not global_ok:                             # sin ClusterRole, al menos lo escaneado
             for nombre_svc in servicios:
                 indice.setdefault(nombre_svc, set()).add(ns)
+            servicios_objetos.extend(servicios_raw)
 
         cms_raw = leer("/api/v1/namespaces/%s/configmaps" % ns, ns, "configmaps", errores) or []
         cms = {c["metadata"]["name"]: c.get("data", {}) or {} for c in cms_raw}
@@ -448,7 +508,9 @@ def leer_topologia():
                             "interno": interno, "ns_dst": ns_dst, "svc": svc,
                             "dueno": dueno_dst})
 
-    aristas.extend(entrada_trafico(dueno, errores))
+    aristas_gw, direcciones_gw = entrada_trafico(dueno, errores)
+    aristas.extend(aristas_gw)
+    aristas.extend(expuestos(servicios_objetos, dueno, direcciones_gw))
     return aristas, fuentes, errores
 
 
@@ -650,10 +712,10 @@ def ciclo():
     aristas, fuentes, errores_ns = leer_topologia()
     destinos = {}
     for a in aristas:
-        destinos[(direccion(a), a["puerto"])] = a
+        if a.get("sondar", True):          # las de entrada no se sondean nunca
+            destinos[(direccion(a), a["puerto"])] = a
     pendientes = [k for k, a in destinos.items()
-                  if a.get("sondar", True)
-                  and "%s:%s" % (a["host"], k[1]) not in NO_SONDEAR and a["host"] not in NO_SONDEAR]
+                  if "%s:%s" % (a["host"], k[1]) not in NO_SONDEAR and a["host"] not in NO_SONDEAR]
     sondas = {}
     argumentos = [(k[0], k[1], protocolo(destinos[k]), destinos[k]["host"]) for k in pendientes]
     with ThreadPoolExecutor(max_workers=16) as ex:
@@ -698,8 +760,9 @@ def metricas():
     ]
     for a in sorted(aristas, key=lambda a: (a["src"], a["host"], a["puerto"])):
         k = (direccion(a), a["puerto"])
-        valor = sondas[k][0] if k in sondas else 2
-        usada = sondas[k][3] if k in sondas else ""
+        sondeada = a.get("sondar", True) and k in sondas
+        valor = sondas[k][0] if sondeada else 2
+        usada = sondas[k][3] if sondeada else ""
         dst = alias(a)
         out.append('dependencia{namespace="%s",src="%s",src_id="%s",src_tipo="%s",'
                    'dst="%s",dst_id="%s",dst_svc="%s",dst_ns="%s",dst_addr="%s",dst_port="%s",'
