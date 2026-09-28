@@ -33,7 +33,10 @@ prometheus.relabel "dependencias_filter" {
   forward_to = [prometheus.remote_write.default.receiver]
   rule {
     source_labels = ["__name__"]
-    regex  = "up|dependencia|dependencia_duracion_segundos|dependencia_fallo_motivo|dependencia_mapper_.*"
+    // Comodín a propósito: las expresiones de Prometheus van ancladas, así que
+    // una lista de nombres deja fuera cualquier métrica nueva sin avisar. Este
+    // scrape apunta solo al pod del mapper, y el mapper solo emite dependencia*.
+    regex  = "up|dependencia.*"
     action = "keep"
   }
 }
