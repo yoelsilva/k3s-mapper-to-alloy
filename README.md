@@ -118,6 +118,43 @@ Un aviso sobre el cambio: al dejar de ser externo, un nodo pasa de llamarse
 panel aparece como un nodo nuevo, no como el mismo renombrado. Es un ejemplo de
 por qué `dst_id` es un id de pantalla y no sirve como clave de correlación.
 
+### Qué workload monta cada volumen
+
+Las métricas de disco del kubelet (`kubelet_volume_stats_*`) dicen cuánto ocupa
+cada PersistentVolumeClaim, pero **no de quién es**. Adivinarlo por el nombre
+falla en cuanto el PVC no se llama como el servicio: `osrm-data` lo monta el
+Deployment `osrm-routed`.
+
+Desde 0.8.0 el mapper lo dice, con una serie por pareja workload-PVC:
+
+```
+dependencia_volumen{namespace,workload,workload_tipo,persistentvolumeclaim} 1
+```
+
+Se cruza con el kubelet por `(namespace, persistentvolumeclaim)`, que es el
+nombre exacto de la etiqueta que usa. No cuesta ninguna llamada nueva a la API:
+sale del mismo objeto que ya se descarga para leer las variables de entorno, y
+tampoco necesita permisos nuevos.
+
+Dos orígenes: `volumes[].persistentVolumeClaim.claimName`, y los
+`volumeClaimTemplates` de un StatefulSet, que Kubernetes crea como
+`<plantilla>-<sts>-<ordinal>`, uno por réplica declarada.
+
+Tres cosas que conviene saber al consumirla:
+
+- **Los PVC de un StatefulSet sobreviven al escalado.** Si se baja de 3 réplicas
+  a 1, Kubernetes conserva los discos de los ordinales 1 y 2. El kubelet seguirá
+  informando de su uso y aquí ya no se atribuirán a nadie: son volúmenes
+  huérfanos, disco que se sigue pagando sin usar. Merece la pena enseñarlos.
+- **Un PVC puede tener varios dueños** si es `ReadWriteMany`. Salen varias
+  series con el mismo `persistentvolumeclaim`; al cruzarlas hay que agrupar o se
+  cuenta el disco dos veces.
+- `workload` vale lo mismo que `src` en `dependencia`, pero **no siempre lo mismo
+  que `dst`**: un alias sobre ese destino cambia el nombre del nodo y rompe el
+  cruce. Otra razón para no poner alias sobre workloads.
+
+Los volúmenes `ephemeral` no se incluyen: no son una declaración estable.
+
 ### Qué comprueba cada sonda
 
 Hay tres niveles, y solo los dos primeros le tocan al mapper:
@@ -200,6 +237,7 @@ dependencia_mapper_duracion_ciclo_segundos
 dependencia_mapper_fuentes{tipo}                    deployment | statefulset | configmap | service
 dependencia_mapper_errores_total
 dependencia_mapper_namespace_error{namespace,recurso,motivo}   403 = falta el RoleBinding
+dependencia_volumen{namespace,workload,workload_tipo,persistentvolumeclaim}
 ```
 
 `dst` es el nombre del nodo destino: alias explícito > workload dueño > host.
@@ -327,8 +365,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.7.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.7.0, :0.7 y :latest
+git tag v0.8.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.8.0, :0.8 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.

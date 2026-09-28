@@ -45,7 +45,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 
 def log(*a):
@@ -439,8 +439,40 @@ def expuestos(servicios, dueno, direcciones_gw):
     return aristas
 
 
+def volumenes(ns, tipo, w):
+    """PVC que un workload declara montar.
+
+    Sale del objeto que ya tenemos descargado, así que no cuesta ni una llamada
+    más a la API. Dos orígenes:
+
+      - `volumes[].persistentVolumeClaim.claimName`: PVC que ya existían.
+      - `volumeClaimTemplates` de un StatefulSet: los crea Kubernetes como
+        `<plantilla>-<sts>-<ordinal>`, uno por réplica declarada.
+
+    Ojo con los segundos: **sobreviven si luego se baja el número de réplicas**.
+    El kubelet seguirá informando del disco de los ordinales que ya no existen y
+    aquí no se atribuirán a nadie. Eso es un volumen huérfano —disco que se
+    sigue pagando sin usar—, no un fallo de esta función.
+    """
+    nombre = w["metadata"]["name"]
+    pvcs = set()
+    for v in (w["spec"]["template"]["spec"].get("volumes") or []):
+        claim = (v.get("persistentVolumeClaim") or {}).get("claimName")
+        if claim:
+            pvcs.add(claim)
+    if tipo == "statefulset":
+        replicas = int(w["spec"].get("replicas") or 1)
+        for p in (w["spec"].get("volumeClaimTemplates") or []):
+            plantilla = (p.get("metadata") or {}).get("name")
+            if plantilla:
+                for i in range(replicas):
+                    pvcs.add("%s-%s-%d" % (plantilla, nombre, i))
+    return [{"ns": ns, "workload": nombre, "tipo": tipo, "pvc": p} for p in sorted(pvcs)]
+
+
 def leer_topologia():
     aristas = []
+    vols = []
     fuentes = {"deployment": 0, "statefulset": 0, "configmap": 0, "service": 0}
     errores = []
     indice, global_ok, servicios_objetos = indice_servicios(errores)
@@ -486,6 +518,7 @@ def leer_topologia():
     # que una flecha a otro namespace puede nombrar su workload destino.
     for ns, servicios, cms, tipo, w in pendientes:
         nombre = w["metadata"]["name"]
+        vols.extend(volumenes(ns, tipo, w))
         datos = {}
         for c in w["spec"]["template"]["spec"].get("containers", []):
             for e in c.get("envFrom", []):
@@ -511,7 +544,7 @@ def leer_topologia():
     aristas_gw, direcciones_gw = entrada_trafico(dueno, errores)
     aristas.extend(aristas_gw)
     aristas.extend(expuestos(servicios_objetos, dueno, direcciones_gw))
-    return aristas, fuentes, errores
+    return aristas, fuentes, errores, vols
 
 
 # ── sondas ───────────────────────────────────────────────────────────────
@@ -703,13 +736,13 @@ def sondear(addr, puerto, proto="tcp", host=None):
 
 # ── ciclo principal ──────────────────────────────────────────────────────
 ESTADO = {"aristas": [], "sondas": {}, "fuentes": {}, "ts": 0, "errores": 0,
-          "duracion_ciclo": 0, "errores_ns": []}
+          "duracion_ciclo": 0, "errores_ns": [], "volumenes": []}
 LOCK = threading.Lock()
 
 
 def ciclo():
     t0 = time.monotonic()
-    aristas, fuentes, errores_ns = leer_topologia()
+    aristas, fuentes, errores_ns, vols = leer_topologia()
     destinos = {}
     for a in aristas:
         if a.get("sondar", True):          # las de entrada no se sondean nunca
@@ -722,7 +755,7 @@ def ciclo():
         for k, r in zip(pendientes, ex.map(lambda x: sondear(*x), argumentos)):
             sondas[k] = r
     with LOCK:
-        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns,
+        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns, volumenes=vols,
                       ts=time.time(), duracion_ciclo=time.monotonic() - t0)
     rojos = sum(1 for r in sondas.values() if r[0] == 0)
     log("ciclo ok: %d flechas, %d destinos, %d en rojo, %.1fs" % (len(aristas), len(destinos), rojos,
@@ -753,6 +786,7 @@ def metricas():
         sondas = dict(ESTADO["sondas"])
         fuentes = dict(ESTADO["fuentes"])
         errores_ns = list(ESTADO["errores_ns"])
+        vols = list(ESTADO["volumenes"])
         ts, errores, dur = ESTADO["ts"], ESTADO["errores"], ESTADO["duracion_ciclo"]
     out = [
         "# HELP dependencia Flecha declarada. 1 destino alcanzable, 0 no alcanzable, 2 no sondeado.",
@@ -803,6 +837,13 @@ def metricas():
         out.append('dependencia_mapper_fuentes{tipo="%s"} %d' % (tipo, n))
     out.append("# TYPE dependencia_mapper_errores_total counter")
     out.append("dependencia_mapper_errores_total %d" % errores)
+    out.append("# HELP dependencia_volumen Que workload declara montar cada PersistentVolumeClaim. "
+               "Se cruza con kubelet_volume_stats_* por (namespace, persistentvolumeclaim).")
+    out.append("# TYPE dependencia_volumen gauge")
+    for v in sorted(vols, key=lambda v: (v["ns"], v["workload"], v["pvc"])):
+        out.append('dependencia_volumen{namespace="%s",workload="%s",workload_tipo="%s",'
+                   'persistentvolumeclaim="%s"} 1' % (
+                       esc(v["ns"]), esc(v["workload"]), esc(v["tipo"]), esc(v["pvc"])))
     out.append("# HELP dependencia_mapper_namespace_error Recurso que el mapper no pudo leer. "
                "motivo: codigo HTTP (403 = falta el RoleBinding) o tipo de excepcion.")
     out.append("# TYPE dependencia_mapper_namespace_error gauge")
