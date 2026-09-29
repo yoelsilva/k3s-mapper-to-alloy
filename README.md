@@ -104,6 +104,7 @@ mapper lee los `Certificate` de cert-manager y dice cuánto les queda:
 ```
 dependencia_certificado_listo{certificado,namespace,gateway}            1 | 0
 dependencia_certificado_caduca_segundos{certificado,namespace,gateway,dominios}
+dependencia_mapper_descartes{motivo}                           el detalle, en /descartes
 ```
 
 Dos métricas y no una porque son cosas distintas: `listo` es el estado ahora, y
@@ -131,6 +132,41 @@ Detalles:
   así que el mapper nunca ve la clave privada ni el certificado en sí: solo su
   estado, su fecha y sus dominios.
 - Sin cert-manager instalado, el 404 del CRD se dice una vez en el log y se sigue.
+
+#### Qué miró el mapper y no dibujó
+
+Cuando una dependencia no aparece en el mapa hay dos explicaciones muy distintas
+—ya no existe, o existe y no la detecto— y hasta 0.10.0 no había forma de
+distinguirlas sin leer los ConfigMaps a mano.
+
+El endpoint `/descartes` devuelve las variables que se miraron y no acabaron en
+una flecha, con el motivo:
+
+| `motivo` | Qué pasó |
+|---|---|
+| `no_parece_host` | El valor no es un Service, ni una IP, ni lleva punto. `DB_DIALECT=postgres` cae aquí |
+| `clave_no_justifica` | Es un host real, pero sin puerto ni esquema y la clave no casa con `claves_regex` |
+| `sin_puerto` | Parece un destino pero no hay puerto ni forma de deducirlo |
+| `host_ignorado` | Una dirección de escucha (`0.0.0.0`, `localhost`) |
+
+```bash
+kubectl -n monitoring get --raw \
+  "/api/v1/namespaces/monitoring/services/dependencias-mapper:9400/proxy/descartes"
+```
+
+Y en métricas solo va el recuento por motivo, `dependencia_mapper_descartes`,
+que sirve de señal: si sube, hay algo que mirar. **El detalle no va a Prometheus
+a propósito**: una serie por variable descartada y por workload serían cientos
+de series para algo que se consulta de tarde en tarde.
+
+Dos cosas deliberadas:
+
+- **Solo se guarda el nombre de la clave y el motivo, nunca el valor.** Un
+  candidato descartado puede ser cualquier cosa, y el mapper no exporta valores
+  de variables. Con la clave ya se sabe qué ConfigMap abrir.
+- **Solo se anota lo ambiguo.** Lo que se excluye por regla explícita —`CORS_*`,
+  `VITE_*` y demás— funciona como está previsto y anotarlo sería ruido que
+  taparía lo que sí importa.
 
 ### Qué significa `externo`
 
@@ -403,8 +439,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.9.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.9.0, :0.9 y :latest
+git tag v0.10.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.10.0, :0.10 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.

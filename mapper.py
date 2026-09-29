@@ -27,6 +27,7 @@ Endpoints HTTP (puerto 9400):
   /metrics   formato Prometheus
   /healthz   200 si el último ciclo es reciente, 503 si no
   /flechas   JSON con las aristas deducidas (para depurar el parseo)
+  /descartes JSON con las variables miradas y descartadas: clave y motivo, sin valores
 
 Configuración: fichero JSON en $CONFIG (por defecto /config/config.json).
 Ejecución local: `kubectl proxy` y KUBE_API_URL=http://127.0.0.1:8001.
@@ -46,7 +47,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 
 def log(*a):
@@ -184,7 +185,23 @@ def cadenas(obj):
             yield from cadenas(v)
 
 
-def candidatos(clave, valor, servicios, ns, solo_explicitos=False):
+def anotar(descartes, clave, motivo):
+    """Deja constancia de una variable que se miró y se descartó.
+
+    Se guarda **solo el nombre de la clave y el motivo**, nunca nada del valor.
+    Un candidato descartado puede ser cualquier cosa —el valor de una variable
+    que no era un host—, y el mapper no exporta valores. Con la clave y el
+    motivo ya se sabe qué ConfigMap mirar.
+
+    Solo se anotan los descartes ambiguos, donde el mapper podría estar
+    equivocándose. Lo que se excluye por regla explícita (CORS, prefijos de
+    navegador) funciona como está previsto y anotarlo sería ruido.
+    """
+    if descartes is not None:
+        descartes.add((clave, motivo))
+
+
+def candidatos(clave, valor, servicios, ns, solo_explicitos=False, descartes=None):
     """yield (host, puerto) por cada dependencia hallada en el valor."""
     v = (valor or "").strip()
     if not v:
@@ -192,7 +209,7 @@ def candidatos(clave, valor, servicios, ns, solo_explicitos=False):
     if v[0] in "[{":                       # JSON: solo host:puerto o URL explícitos
         try:
             for s in cadenas(json.loads(v)):
-                yield from candidatos(clave, s, servicios, ns, True)
+                yield from candidatos(clave, s, servicios, ns, True, descartes)
         except ValueError:
             pass
         return
@@ -207,28 +224,31 @@ def candidatos(clave, valor, servicios, ns, solo_explicitos=False):
             esquema, host, puerto = None, m.group(1), m.group(2)
         host = normalizar(host, ns)
         if host in HOSTS_IGNORAR:
+            anotar(descartes, clave, "host_ignorado")
             continue
         es_dep = host in servicios or RE_IP.match(host) or "." in host
         if not es_dep:
+            anotar(descartes, clave, "no_parece_host")
             continue
         explicito = bool(puerto or esquema)
         if solo_explicitos and not explicito:
             continue
         # host suelto sin puerto ni esquema: solo si la clave lo justifica
         if not explicito and not RE_CLAVE.search(clave):
+            anotar(descartes, clave, "clave_no_justifica")
             continue
         yield host, puerto or puerto_defecto(clave, esquema), esquema
 
 
-def extraer(data, servicios, ns):
+def extraer(data, servicios, ns, descartes=None):
     """{(host, puerto): (clave, esquema)} a partir de un dict de variables."""
     deps = {}
     for clave, valor in data.items():
         if RE_EXCLUIR.search(clave):
-            continue
+            continue                       # excluida por regla: previsto, no es ambiguo
         if clave.upper().startswith(PREF_NAVEGADOR) and not INCLUIR_NAVEGADOR:
             continue
-        for host, puerto, esquema in candidatos(clave, valor, servicios, ns):
+        for host, puerto, esquema in candidatos(clave, valor, servicios, ns, False, descartes):
             if not puerto:                 # ¿existe <PREFIJO>_PORT?
                 pref = re.sub(r"_(HOST|HOSTS|ADDR|ADDRESS|URL|URI|ENDPOINT|SERVER)$", "", clave.upper())
                 for k2, v2 in data.items():
@@ -236,6 +256,8 @@ def extraer(data, servicios, ns):
                         puerto = str(v2)
             if puerto:
                 deps.setdefault((host, puerto), (clave, esquema))
+            else:
+                anotar(descartes, clave, "sin_puerto")
     return deps
 
 
@@ -532,6 +554,7 @@ def volumenes(ns, tipo, w):
 def leer_topologia():
     aristas = []
     vols = []
+    descartes = []
     fuentes = {"deployment": 0, "statefulset": 0, "configmap": 0, "service": 0}
     errores = []
     indice, global_ok, servicios_objetos = indice_servicios(errores)
@@ -590,7 +613,8 @@ def leer_topologia():
                 ref = e.get("valueFrom", {}).get("configMapKeyRef")
                 if ref:
                     datos[e["name"]] = cms.get(ref["name"], {}).get(ref["key"], "")
-        for (host, puerto), (clave, esquema) in extraer(datos, servicios, ns).items():
+        propios = set()
+        for (host, puerto), (clave, esquema) in extraer(datos, servicios, ns, propios).items():
             interno, ns_dst, svc = clasificar(host, ns, indice)
             dueno_dst = dueno.get((ns_dst, svc)) if interno else None
             if host.startswith(nombre) or (dueno_dst == nombre and ns_dst == ns):
@@ -599,12 +623,14 @@ def leer_topologia():
                             "host": host, "puerto": puerto, "clave": clave, "esquema": esquema,
                             "interno": interno, "ns_dst": ns_dst, "svc": svc,
                             "dueno": dueno_dst})
+        for clave, motivo in sorted(propios):
+            descartes.append({"ns": ns, "src": nombre, "clave": clave, "motivo": motivo})
 
     secretos_gw = {}
     aristas_gw, direcciones_gw = entrada_trafico(dueno, errores, secretos_gw)
     aristas.extend(aristas_gw)
     aristas.extend(expuestos(servicios_objetos, dueno, direcciones_gw))
-    return aristas, fuentes, errores, vols, certificados(secretos_gw, errores)
+    return aristas, fuentes, errores, vols, certificados(secretos_gw, errores), descartes
 
 
 # ── sondas ───────────────────────────────────────────────────────────────
@@ -796,13 +822,13 @@ def sondear(addr, puerto, proto="tcp", host=None):
 
 # ── ciclo principal ──────────────────────────────────────────────────────
 ESTADO = {"aristas": [], "sondas": {}, "fuentes": {}, "ts": 0, "errores": 0,
-          "duracion_ciclo": 0, "errores_ns": [], "volumenes": [], "certificados": []}
+          "duracion_ciclo": 0, "errores_ns": [], "volumenes": [], "certificados": [], "descartes": []}
 LOCK = threading.Lock()
 
 
 def ciclo():
     t0 = time.monotonic()
-    aristas, fuentes, errores_ns, vols, certs = leer_topologia()
+    aristas, fuentes, errores_ns, vols, certs, descartes = leer_topologia()
     destinos = {}
     for a in aristas:
         if a.get("sondar", True):          # las de entrada no se sondean nunca
@@ -815,7 +841,7 @@ def ciclo():
         for k, r in zip(pendientes, ex.map(lambda x: sondear(*x), argumentos)):
             sondas[k] = r
     with LOCK:
-        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns, volumenes=vols, certificados=certs,
+        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns, volumenes=vols, certificados=certs, descartes=descartes,
                       ts=time.time(), duracion_ciclo=time.monotonic() - t0)
     rojos = sum(1 for r in sondas.values() if r[0] == 0)
     log("ciclo ok: %d flechas, %d destinos, %d en rojo, %.1fs" % (len(aristas), len(destinos), rojos,
@@ -848,6 +874,7 @@ def metricas():
         errores_ns = list(ESTADO["errores_ns"])
         vols = list(ESTADO["volumenes"])
         certs = list(ESTADO["certificados"])
+        descartes = list(ESTADO["descartes"])
         ts, errores, dur = ESTADO["ts"], ESTADO["errores"], ESTADO["duracion_ciclo"]
     out = [
         "# HELP dependencia Flecha declarada. 1 destino alcanzable, 0 no alcanzable, 2 no sondeado.",
@@ -905,6 +932,14 @@ def metricas():
         out.append('dependencia_volumen{namespace="%s",workload="%s",workload_tipo="%s",'
                    'persistentvolumeclaim="%s"} 1' % (
                        esc(v["ns"]), esc(v["workload"]), esc(v["tipo"]), esc(v["pvc"])))
+    out.append("# HELP dependencia_mapper_descartes Variables que el mapper miro y descarto por "
+               "ambiguas, contadas por motivo. El detalle esta en /descartes.")
+    out.append("# TYPE dependencia_mapper_descartes gauge")
+    por_motivo = {}
+    for d in descartes:
+        por_motivo[d["motivo"]] = por_motivo.get(d["motivo"], 0) + 1
+    for motivo, n in sorted(por_motivo.items()):
+        out.append('dependencia_mapper_descartes{motivo="%s"} %d' % (esc(motivo), n))
     out.append("# HELP dependencia_certificado_listo 1 si el Certificate esta Ready, 0 si no.")
     out.append("# TYPE dependencia_certificado_listo gauge")
     for c in sorted(certs, key=lambda c: (c["ns"], c["nombre"])):
@@ -947,6 +982,13 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/healthz"):
             fresco = time.time() - ESTADO["ts"] < INTERVALO * 3
             self._send(200 if fresco else 503, "ok\n" if fresco else "stale\n", "text/plain")
+        elif self.path.startswith("/descartes"):
+            # Qué variables se miraron y no acabaron en una flecha. Solo la clave
+            # y el motivo: nunca el valor. Sirve para distinguir "esa dependencia
+            # ya no existe" de "existe pero no la detecto".
+            with LOCK:
+                cuerpo = json.dumps(ESTADO["descartes"], indent=1, ensure_ascii=False)
+            self._send(200, cuerpo, "application/json")
         elif self.path.startswith("/flechas"):
             with LOCK:
                 cuerpo = json.dumps(ESTADO["aristas"], indent=1, ensure_ascii=False)

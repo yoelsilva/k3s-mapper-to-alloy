@@ -150,8 +150,10 @@ for a in sorted(json.load(sys.stdin), key=lambda a:(a['src'],a['host'])):
     print(f\"{a['src']:32} → {a['host']}:{a['puerto']:<6} ({a['clave']})\")"
 ```
 
-Tres endpoints en el puerto 9400: `/metrics` (Prometheus), `/healthz` (las sondas
-del kubelet) y `/flechas` (JSON con lo deducido, para depurar el parseo).
+Cuatro endpoints en el puerto 9400: `/metrics` (Prometheus), `/healthz` (las
+sondas del kubelet), `/flechas` (JSON con lo deducido, para depurar el parseo) y
+`/descartes` (lo que miró y NO dibujó, con el motivo — para distinguir «esa
+dependencia ya no existe» de «existe y no la detecto»).
 
 ## Añadir otro clúster
 
