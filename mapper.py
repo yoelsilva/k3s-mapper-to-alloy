@@ -31,6 +31,7 @@ Endpoints HTTP (puerto 9400):
 Configuración: fichero JSON en $CONFIG (por defecto /config/config.json).
 Ejecución local: `kubectl proxy` y KUBE_API_URL=http://127.0.0.1:8001.
 """
+import datetime
 import json
 import os
 import re
@@ -45,7 +46,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 
 def log(*a):
@@ -329,11 +330,12 @@ def direccion_gateway(g):
     return (ips or [d["value"] for d in addrs] or [""])[0]
 
 
-def entrada_trafico(dueno, errores):
+def entrada_trafico(dueno, errores, secretos=None):
     """Flechas de entrada: internet → Gateway → backend de cada ruta.
 
-    Devuelve (aristas, direcciones de los Gateway), que hacen falta después
-    para no contar dos veces el LoadBalancer del propio Gateway.
+    Devuelve (aristas, direcciones de los Gateway). Si se le pasa `secretos`,
+    lo rellena con {(namespace, secreto TLS): nombre del Gateway}, que es lo
+    que después ata cada certificado con el Gateway que lo usa.
     """
     gateways = leer_gw("gateways", errores)
     if gateways is None:
@@ -351,6 +353,13 @@ def entrada_trafico(dueno, errores):
         for d in (g.get("status", {}).get("addresses") or []):
             if d.get("value"):
                 direcciones_gw.add(d["value"])
+        # Secreto TLS -> Gateway que lo usa. El namespace de un certificateRef
+        # ausente es el del propio Gateway.
+        if secretos is not None:
+            for l in (g.get("spec", {}).get("listeners") or []):
+                for ref in ((l.get("tls") or {}).get("certificateRefs") or []):
+                    if ref.get("name"):
+                        secretos[(ref.get("namespace") or gns, ref["name"])] = gnombre
         puertos = sorted({str(l["port"]) for l in (g.get("spec", {}).get("listeners") or [])
                           if l.get("port")})
         for p in puertos:
@@ -437,6 +446,56 @@ def expuestos(servicios, dueno, direcciones_gw):
                 "sondar": False,                       # mismo motivo que el Gateway
             })
     return aristas
+
+
+CM_API = "/apis/cert-manager.io/v1"
+
+
+def certificados(secretos, errores):
+    """Estado y caducidad de los certificados, atados al Gateway que los usa.
+
+    Se descubre por tipo de recurso, como todo lo demás: si cert-manager no
+    está instalado, el 404 del CRD se dice una vez y se sigue.
+
+    Un certificado que no use ningún Gateway sale igualmente, con `gateway`
+    vacío: uno que caduca y que nadie ata a nada sigue siendo algo que hay que
+    ver, y omitirlo sería esconderlo.
+    """
+    try:
+        certs = api_get("%s/certificates" % CM_API)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            if "certificates" not in SIN_GATEWAY_API:
+                SIN_GATEWAY_API.add("certificates")
+                log("cert-manager no instalado: no se informa de certificados")
+            return []
+        errores.append(("*", "certificates", str(e.code)))
+        return []
+    except Exception as e:
+        errores.append(("*", "certificates", type(e).__name__))
+        return []
+
+    ahora = time.time()
+    salida = []
+    for c in certs:
+        ns, nombre = c["metadata"]["namespace"], c["metadata"]["name"]
+        spec, estado = c.get("spec", {}) or {}, c.get("status", {}) or {}
+        listo = any(cond.get("type") == "Ready" and cond.get("status") == "True"
+                    for cond in (estado.get("conditions") or []))
+        segundos = None
+        if estado.get("notAfter"):
+            try:
+                caduca = datetime.datetime.fromisoformat(estado["notAfter"])
+                segundos = caduca.timestamp() - ahora
+            except ValueError:
+                pass                                  # formato inesperado: mejor nada que un número falso
+        salida.append({
+            "ns": ns, "nombre": nombre,
+            "gateway": secretos.get((ns, spec.get("secretName")), ""),
+            "dominios": ",".join(spec.get("dnsNames") or []),
+            "listo": listo, "segundos": segundos,
+        })
+    return salida
 
 
 def volumenes(ns, tipo, w):
@@ -541,10 +600,11 @@ def leer_topologia():
                             "interno": interno, "ns_dst": ns_dst, "svc": svc,
                             "dueno": dueno_dst})
 
-    aristas_gw, direcciones_gw = entrada_trafico(dueno, errores)
+    secretos_gw = {}
+    aristas_gw, direcciones_gw = entrada_trafico(dueno, errores, secretos_gw)
     aristas.extend(aristas_gw)
     aristas.extend(expuestos(servicios_objetos, dueno, direcciones_gw))
-    return aristas, fuentes, errores, vols
+    return aristas, fuentes, errores, vols, certificados(secretos_gw, errores)
 
 
 # ── sondas ───────────────────────────────────────────────────────────────
@@ -736,13 +796,13 @@ def sondear(addr, puerto, proto="tcp", host=None):
 
 # ── ciclo principal ──────────────────────────────────────────────────────
 ESTADO = {"aristas": [], "sondas": {}, "fuentes": {}, "ts": 0, "errores": 0,
-          "duracion_ciclo": 0, "errores_ns": [], "volumenes": []}
+          "duracion_ciclo": 0, "errores_ns": [], "volumenes": [], "certificados": []}
 LOCK = threading.Lock()
 
 
 def ciclo():
     t0 = time.monotonic()
-    aristas, fuentes, errores_ns, vols = leer_topologia()
+    aristas, fuentes, errores_ns, vols, certs = leer_topologia()
     destinos = {}
     for a in aristas:
         if a.get("sondar", True):          # las de entrada no se sondean nunca
@@ -755,7 +815,7 @@ def ciclo():
         for k, r in zip(pendientes, ex.map(lambda x: sondear(*x), argumentos)):
             sondas[k] = r
     with LOCK:
-        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns, volumenes=vols,
+        ESTADO.update(aristas=aristas, sondas=sondas, fuentes=fuentes, errores_ns=errores_ns, volumenes=vols, certificados=certs,
                       ts=time.time(), duracion_ciclo=time.monotonic() - t0)
     rojos = sum(1 for r in sondas.values() if r[0] == 0)
     log("ciclo ok: %d flechas, %d destinos, %d en rojo, %.1fs" % (len(aristas), len(destinos), rojos,
@@ -787,6 +847,7 @@ def metricas():
         fuentes = dict(ESTADO["fuentes"])
         errores_ns = list(ESTADO["errores_ns"])
         vols = list(ESTADO["volumenes"])
+        certs = list(ESTADO["certificados"])
         ts, errores, dur = ESTADO["ts"], ESTADO["errores"], ESTADO["duracion_ciclo"]
     out = [
         "# HELP dependencia Flecha declarada. 1 destino alcanzable, 0 no alcanzable, 2 no sondeado.",
@@ -844,6 +905,21 @@ def metricas():
         out.append('dependencia_volumen{namespace="%s",workload="%s",workload_tipo="%s",'
                    'persistentvolumeclaim="%s"} 1' % (
                        esc(v["ns"]), esc(v["workload"]), esc(v["tipo"]), esc(v["pvc"])))
+    out.append("# HELP dependencia_certificado_listo 1 si el Certificate esta Ready, 0 si no.")
+    out.append("# TYPE dependencia_certificado_listo gauge")
+    for c in sorted(certs, key=lambda c: (c["ns"], c["nombre"])):
+        out.append('dependencia_certificado_listo{certificado="%s",namespace="%s",gateway="%s"} %d' % (
+            esc(c["nombre"]), esc(c["ns"]), esc(c["gateway"]), 1 if c["listo"] else 0))
+    out.append("# HELP dependencia_certificado_caduca_segundos Segundos hasta notAfter. "
+               "Negativo si ya caduco. Ausente si el certificado aun no se ha emitido.")
+    out.append("# TYPE dependencia_certificado_caduca_segundos gauge")
+    for c in sorted(certs, key=lambda c: (c["ns"], c["nombre"])):
+        if c["segundos"] is None:
+            continue
+        out.append('dependencia_certificado_caduca_segundos{certificado="%s",namespace="%s",'
+                   'gateway="%s",dominios="%s"} %.0f' % (
+                       esc(c["nombre"]), esc(c["ns"]), esc(c["gateway"]),
+                       esc(c["dominios"]), c["segundos"]))
     out.append("# HELP dependencia_mapper_namespace_error Recurso que el mapper no pudo leer. "
                "motivo: codigo HTTP (403 = falta el RoleBinding) o tipo de excepcion.")
     out.append("# TYPE dependencia_mapper_namespace_error gauge")

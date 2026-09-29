@@ -72,6 +72,12 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gateways", "httproutes"]
     verbs: ["get", "list"]
+  # Certificates, para avisar de una caducidad antes de que tumbe la entrada.
+  # Solo el objeto Certificate: NO se leen los Secrets, así que el mapper nunca
+  # ve la clave privada ni el certificado en sí, solo su estado y su fecha.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

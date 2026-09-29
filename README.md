@@ -96,6 +96,42 @@ por su nombre, que cada implementación se inventa a su manera.
 
 No hace falta ningún permiso nuevo: se apoya en el ClusterRole de Services.
 
+#### Certificados: avisar antes de que caduquen
+
+Un certificado caducado tumba la entrada del clúster entera. Desde 0.9.0 el
+mapper lee los `Certificate` de cert-manager y dice cuánto les queda:
+
+```
+dependencia_certificado_listo{certificado,namespace,gateway}            1 | 0
+dependencia_certificado_caduca_segundos{certificado,namespace,gateway,dominios}
+```
+
+Dos métricas y no una porque son cosas distintas: `listo` es el estado ahora, y
+la cuenta atrás es un número que baja. Meter «listo» como etiqueta de la segunda
+habría cambiado la identidad de la serie cada vez que el certificado se renueva.
+
+Una alerta de las que valen la pena:
+
+```promql
+dependencia_certificado_caduca_segundos < 7 * 24 * 3600
+```
+
+Detalles:
+
+- `gateway` sale de cruzar el `spec.secretName` del certificado con los
+  `certificateRefs` de los listeners. Un `certificateRef` sin namespace apunta
+  al del propio Gateway.
+- **Un certificado que no usa ningún Gateway sale igualmente**, con `gateway`
+  vacío. Uno que caduca y que nadie ata a nada sigue siendo algo que hay que ver;
+  omitirlo sería esconderlo.
+- Si aún no se ha emitido, sale `listo=0` y **sin** métrica de caducidad: no hay
+  fecha que dar, y un cero ahí se leería como «caduca ahora mismo».
+- Si ya caducó, los segundos van en negativo.
+- **No se leen los Secrets.** El permiso es solo sobre el objeto `Certificate`,
+  así que el mapper nunca ve la clave privada ni el certificado en sí: solo su
+  estado, su fecha y sus dominios.
+- Sin cert-manager instalado, el 404 del CRD se dice una vez en el log y se sigue.
+
 ### Qué significa `externo`
 
 **Sale del clúster**, no "sale del namespace". El namespace es una división
@@ -128,7 +164,9 @@ Deployment `osrm-routed`.
 Desde 0.8.0 el mapper lo dice, con una serie por pareja workload-PVC:
 
 ```
-dependencia_volumen{namespace,workload,workload_tipo,persistentvolumeclaim} 1
+dependencia_volumen{namespace,workload,workload_tipo,persistentvolumeclaim}
+dependencia_certificado_listo{certificado,namespace,gateway}
+dependencia_certificado_caduca_segundos{certificado,namespace,gateway,dominios} 1
 ```
 
 Se cruza con el kubelet por `(namespace, persistentvolumeclaim)`, que es el
@@ -365,8 +403,8 @@ workflow pide `packages: write`.
 
 ```bash
 # actualizar VERSION en mapper.py, y luego:
-git tag v0.8.0 && git push --tags
-#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.8.0, :0.8 y :latest
+git tag v0.9.0 && git push --tags
+#  → ghcr.io/yoelsilva/k3s-mapper-to-alloy:0.9.0, :0.9 y :latest
 ```
 
 Los push a `main` publican `:main` y `:sha-xxxxxxx` para probar sin etiquetar.
